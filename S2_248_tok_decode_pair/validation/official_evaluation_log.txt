@@ -1,0 +1,263 @@
+=== receive · 2026-10-11 13:23:33 UTC ===
+accepted 166 file(s):
+  src/axes.rs
+  src/bin/gemma4.rs
+  src/bin/server.rs
+  src/bin/test_kernels.rs
+  src/chunk_host.rs
+  src/dattn_host.rs
+  src/device/audio/mod.rs
+  src/device/audio/projection.rs
+  src/device/chunk/append.rs
+  src/device/chunk/full_chunk.rs
+  src/device/chunk/mod.rs
+  src/device/chunk/sliding.rs
+  src/device/chunk/sliding_chunk.rs
+  src/device/dattn/append.rs
+  src/device/dattn/chunk_flat.rs
+  src/device/dattn/full.rs
+  src/device/dattn/full_chunk_flat.rs
+  src/device/dattn/mod.rs
+  src/device/dattn/sliding.rs
+  src/device/dattn/sliding_blk.rs
+  src/device/dattn/sliding_blk_tier.rs
+  src/device/f8/ffn.rs
+  src/device/f8/mod.rs
+  src/device/f8/quant.rs
+  src/device/f8/tok.rs
+  src/device/ffnc/ao.rs
+  src/device/ffnc/ffn.rs
+  src/device/ffnc/mod.rs
+  src/device/ffnc/norm.rs
+  src/device/ffnc/normp.rs
+  src/device/full/attention.rs
+  src/device/full/mod.rs
+  src/device/full/projection.rs
+  src/device/full/rmsnorm.rs
+  src/device/full/rope.rs
+  src/device/layout.rs
+  src/device/lmhead/argmax.rs
+  src/device/lmhead/mod.rs
+  src/device/lmhead/norm.rs
+  src/device/mm/gemm.rs
+  src/device/mm/mod.rs
+  src/device/mm/norm.rs
+  src/device/mod.rs
+  src/device/qkvc/full.rs
+  src/device/qkvc/gemm.rs
+  src/device/qkvc/mod.rs
+  src/device/qkvc/pair.rs
+  src/device/qkvc/pair2.rs
+  src/device/qkvc/post.rs
+  src/device/qkvc/post_full.rs
+  src/device/qkvc/quad.rs
+  src/device/qkvc/quad_full.rs
+  src/device/qkvc/quadh.rs
+  src/device/qkvc/quadhf.rs
+  src/device/qkvc/quadp.rs
+  src/device/qkvc/sliding.rs
+  src/device/qkvc/t8/full.rs
+  src/device/qkvc/t8/gemm.rs
+  src/device/qkvc/t8/mod.rs
+  src/device/qkvc/t8/post.rs
+  src/device/qkvc/t8/post_full.rs
+  src/device/qkvc/t8/sliding.rs
+  src/device/qkvc/t8/xnorm.rs
+  src/device/qkvc/xnorm.rs
+  src/device/refimpl/layout.rs
+  src/device/refimpl/mod.rs
+  src/device/refimpl/shared/lm_head.rs
+  src/device/refimpl/shared/mlp.rs
+  src/device/refimpl/shared/mod.rs
+  src/device/refimpl/shared/residual.rs
+  src/device/refimpl/shared/rmsnorm.rs
+  src/device/refimpl/sliding/attention.rs
+  src/device/refimpl/sliding/mod.rs
+  src/device/refimpl/sliding/projection.rs
+  src/device/refimpl/sliding/rmsnorm.rs
+  src/device/refimpl/sliding/rope.rs
+  src/device/rpa/full_pair.rs
+  src/device/rpa/full_pair_h4.rs
+  src/device/rpa/mod.rs
+  src/device/rpa/prefill.rs
+  src/device/rpa/prefill_kvd.rs
+  src/device/rpa/prefill_kvd256.rs
+  src/device/shared/lm_head.rs
+  src/device/shared/mlp.rs
+  src/device/shared/mod.rs
+  src/device/shared/residual.rs
+  src/device/shared/rmsnorm.rs
+  src/device/sliding/attention.rs
+  src/device/sliding/mod.rs
+  src/device/sliding/projection.rs
+  src/device/sliding/qkv_h4.rs
+  src/device/sliding/qkv_h4_norm.rs
+  src/device/sliding/qkv_k15b.rs
+  src/device/sliding/qkv_r21.rs
+  src/device/sliding/qkv_r21_norm.rs
+  src/device/sliding/qkv_r5.rs
+  src/device/sliding/qkv_r5_norm.rs
+  src/device/sliding/rmsnorm.rs
+  src/device/sliding/rope.rs
+  src/device/sliding/rope_h4.rs
+  src/device/vision/layernorm.rs
+  src/device/vision/mod.rs
+  src/device/vision/projection.rs
+  src/host/audio.rs
+  src/host/chunkw.rs
+  src/host/cpuplace.rs
+  src/host/fp8.rs
+  src/host/generate.rs
+  src/host/image.rs
+  src/host/jpegdec/LICENSE-APACHE
+  src/host/jpegdec/LICENSE-MIT
+  src/host/jpegdec/decoder.rs
+  src/host/jpegdec/decoder/lossless.rs
+  src/host/jpegdec/error.rs
+  src/host/jpegdec/huffman.rs
+  src/host/jpegdec/idct.rs
+  src/host/jpegdec/marker.rs
+  src/host/jpegdec/mod.rs
+  src/host/jpegdec/parser.rs
+  src/host/jpegdec/upsampler.rs
+  src/host/jpegdec/worker/immediate.rs
+  src/host/jpegdec/worker/mod.rs
+  src/host/jpegdec/worker/multithreaded.rs
+  src/host/lmhead.rs
+  src/host/load.rs
+  src/host/mm.rs
+  src/host/mod.rs
+  src/host/model.rs
+  src/host/packed.rs
+  src/host/plan256.rs
+  src/host/prof.rs
+  src/host/qkvc.rs
+  src/host/runtime.rs
+  src/host/runtime/chunk.rs
+  src/host/runtime/d13e.rs
+  src/host/runtime/decode.rs
+  src/host/runtime/hybrid.rs
+  src/host/runtime/hybrid256.rs
+  src/host/sampling.rs
+  src/host/sleepwait.rs
+  src/host/tokenizer.rs
+  src/host/views.rs
+  src/host/worker.rs
+  src/lib.rs
+  src/lmh_trace.rs
+  src/lmhead_host.rs
+  src/mm_norm.rs
+  src/mm_pack.rs
+  src/ops.rs
+  src/ops_audio.rs
+  src/ops_chunk.rs
+  src/ops_d13e.rs
+  src/ops_dattn.rs
+  src/ops_f8.rs
+  src/ops_ffnc.rs
+  src/ops_fl.rs
+  src/ops_lmhead.rs
+  src/ops_mig.rs
+  src/ops_mm.rs
+  src/ops_qkvc.rs
+  src/ops_ref.rs
+  src/ops_rpa.rs
+  src/ops_rpa_full.rs
+  src/ops_t128.rs
+  src/ops_vision.rs
+  src/rpa_host.rs
+
+=== validate · 2026-10-11 13:23:33 UTC ===
+==> checking the submission layout
+    layout OK (furiosa-opt-std 0.8.1)
+
+=== build · 2026-10-11 13:23:34 UTC ===
+==> building on kernel-builder
+
+==> build succeeded
+
+=== evaluate · 2026-10-11 13:49:00 UTC ===
+Running the evaluation with the AI-BMT CLI.
+╭────────────────────────────────────────────╮
+│       ███╗   ███╗  ██████╗   █████╗        │
+│       ████╗ ████║ ██╔═══██╗ ██╔══██╗       │
+│       ██╔████╔██║ ██║   ██║ ███████║       │
+│       ██║╚██╔╝██║ ██║   ██║ ██╔══██║       │
+│       ██║ ╚═╝ ██║ ╚██████╔╝ ██║  ██║       │
+│       ╚═╝     ╚═╝  ╚═════╝  ╚═╝  ╚═╝       │
+│                                            │
+│              W O R K S H O P               │
+│                                            │
+│            AI-BMT @ MICRO 2026             │
+│  Round 2. Model Optimization Competition   │
+│       Gemma 4 12B on FuriosaAI RNGD        │
+│      https://micro2026-moa.github.io/      │
+╰────────────────────────────────────────────╯
+accuracy: queued on the NPU cluster as job 219866
+accuracy: running on the NPU
+remote_moa_entrypoint.sh: starting Gemma4 server on 127.0.0.1:8000
+remote_moa_entrypoint.sh: server is ready
+
+AI-BMT-MOA started
+─────────────── ACCURACY MODE ────────────────
+
+  Processing: 3 / 32 requests
+  Processing: 6 / 32 requests
+  Processing: 9 / 32 requests
+  Processing: 12 / 32 requests
+  Processing: 15 / 32 requests
+  Processing: 18 / 32 requests
+  Processing: 21 / 32 requests
+  Processing: 24 / 32 requests
+  Processing: 27 / 32 requests
+  Processing: 30 / 32 requests
+  Processing: 32 / 32 requests
+  Status: PASS
+  Accuracy: 32 / 32 cases passed (2 rounds)
+──────────────────────────────────────────────
+performance: queued on the NPU cluster as job 219895
+performance: running on the NPU
+remote_moa_entrypoint.sh: starting Gemma4 server on 127.0.0.1:8000
+remote_moa_entrypoint.sh: server is ready
+
+AI-BMT-MOA started
+────────────── PERFORMANCE MODE ──────────────
+
+  Warmup: 2 / 22 requests
+  Warmup: 4 / 22 requests
+  Warmup: 6 / 22 requests
+  Warmup: 8 / 22 requests
+  Warmup: 10 / 22 requests
+  Warmup: 12 / 22 requests
+  Warmup: 14 / 22 requests
+  Warmup: 16 / 22 requests
+  Warmup: 18 / 22 requests
+  Warmup: 20 / 22 requests
+  Warmup: 22 / 22 requests
+  Measurement: 33 / 330 requests
+  Measurement: 66 / 330 requests
+  Measurement: 99 / 330 requests
+  Measurement: 132 / 330 requests
+  Measurement: 165 / 330 requests
+  Measurement: 198 / 330 requests
+  Measurement: 231 / 330 requests
+  Measurement: 264 / 330 requests
+  Measurement: 297 / 330 requests
+  Measurement: 330 / 330 requests
+  Performance
+    concurrency 22, repeat 3, 330 measured requests (after 22 warmup)
+
+    throughput     247.99 tokens/s   (3.89 requests/s)
+    TTFT p50/p90   1544.84 ms / 1847.22 ms
+    TPOT p50/p90   63.19 ms / 65.93 ms
+
+    split by input type:
+      256 text    TTFT 1411.45 ms / 1740.22 ms    TPOT 63.42 ms / 66.19 ms
+      1024 text   TTFT 1544.84 ms / 1793.26 ms    TPOT 62.79 ms / 64.79 ms
+      2048 text   TTFT 1705.86 ms / 2031.71 ms    TPOT 62.12 ms / 64.41 ms
+      512 image   TTFT 1491.69 ms / 1791.59 ms    TPOT 63.72 ms / 68.17 ms
+      768 audio   TTFT 1488.12 ms / 1790.26 ms    TPOT 63.09 ms / 65.34 ms
+──────────────────────────────────────────────
+Score: 247.9917 (generated tokens/s)
+Latency passed: TTFT p90 1.85 s <= 4.00 s, TPOT p90 65.9 ms <= 100.0 ms.
+submission completed

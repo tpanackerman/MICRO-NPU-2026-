@@ -1,0 +1,32 @@
+{
+  "kind": "Bounded public Arena diagnostic, not official score",
+  "base_variant": "exact295",
+  "concurrency": 30,
+  "pairs": 1,
+  "warmup_requests": 30,
+  "measured_requests": 120,
+  "waves": 4,
+  "records": [
+    {
+      "arm": "candidate",
+      "pair": 1,
+      "job": 256628,
+      "status": "SUCCEEDED",
+      "correctness_passed": true,
+      "gates": {
+        "ttft_p90_ok": true,
+        "tpot_p90_ok": true
+      },
+      "tps": 322.93390740273566,
+      "ttft_p90_ms": 3708.8807048276067,
+      "tpot_p90_ms": 58.861334682516166,
+      "server_sha256": "bde89a46b54cc9e261cba7c82de17a2c671d6cdb708676858e767870767c3806"
+    }
+  ],
+  "mean_tps": {
+    "candidate": 322.93390740273566,
+    "base": NaN
+  },
+  "gain_pct": NaN,
+  "baseline_official_tps": 295.4715
+}

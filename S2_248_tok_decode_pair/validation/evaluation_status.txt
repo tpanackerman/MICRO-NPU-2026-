@@ -1,0 +1,11 @@
+Submission:   b1df92a0
+Team:         EDABK-Artemis
+Status:       completed [test]
+Kind:         test run (--bin), not added to the leaderboard
+Stage:        evaluate
+Submitted:    2026-10-11 12:38
+Finished:     2026-10-11 12:44
+
+Score:        248.6798
+
+Full log:     moa-submitter log b1df92a0

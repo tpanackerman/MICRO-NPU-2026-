@@ -1,0 +1,34 @@
+* text=auto eol=lf
+*.safetensors binary
+
+# S2_163_tok: CRLF sources of the submitted version keep their exact bytes
+S2_163_tok/src/ops_ffnc.rs -text
+S2_163_tok/src/device/chunk/sliding.rs -text
+S2_163_tok/src/device/ffnc/ffn.rs -text
+S2_163_tok/src/device/ffnc/normp.rs -text
+S2_163_tok/src/host/packed.rs -text
+
+# S2_203_tok: CRLF sources of the submitted version keep their exact bytes
+S2_203_tok/src/device/chunk/sliding.rs -text
+S2_203_tok/src/device/ffnc/ffn.rs -text
+S2_203_tok/src/device/ffnc/normp.rs -text
+S2_203_tok/src/host/packed.rs -text
+S2_203_tok/src/ops_ffnc.rs -text
+
+# S2_211_tok: CRLF sources of the submitted version keep their exact bytes
+S2_211_tok/src/host/runtime.rs -text
+
+# S2_QKV256_FP8: CRLF sources (unchanged from S2_203_tok) keep their exact bytes
+S2_QKV256_FP8/src/device/chunk/sliding.rs -text
+S2_QKV256_FP8/src/device/ffnc/ffn.rs -text
+S2_QKV256_FP8/src/device/ffnc/normp.rs -text
+S2_QKV256_FP8/src/host/packed.rs -text
+S2_QKV256_FP8/src/ops_ffnc.rs -text
+
+# S2_242_tok: CRLF sources of the submitted version keep their exact bytes
+S2_242_tok/src/device/chunk/sliding.rs -text
+S2_242_tok/src/device/ffnc/normp.rs -text
+S2_242_tok/src/host/mod.rs -text
+S2_242_tok/src/host/packed.rs -text
+S2_242_tok/src/host/jpegdec/decoder.rs -text
+S2_242_tok/src/host/jpegdec/idct.rs -text

@@ -1,0 +1,10 @@
+Submission:   0759d92a
+Team:         EDABK-Artemis
+Status:       completed
+Stage:        evaluate
+Submitted:    2026-10-11 13:23
+Finished:     2026-10-11 13:56
+
+Score:        247.9917
+
+Full log:     moa-submitter log 0759d92a

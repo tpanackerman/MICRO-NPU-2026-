@@ -1,0 +1,11 @@
+Submission:   ad45834b
+Team:         EDABK-Artemis
+Status:       completed [test]
+Kind:         test run (--bin), not added to the leaderboard
+Stage:        evaluate
+Submitted:    2026-10-11 12:32
+Finished:     2026-10-11 12:38
+
+Score:        231.3123
+
+Full log:     moa-submitter log ad45834b

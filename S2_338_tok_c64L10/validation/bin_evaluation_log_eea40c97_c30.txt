@@ -1,0 +1,88 @@
+=== receive · 2026-10-16 03:58:26 UTC ===
+accepted a prebuilt server binary (27.9 MiB, sha256 bde89a46b54c); the build step is skipped.
+
+=== evaluate · 2026-10-16 03:58:26 UTC ===
+Running the evaluation with the AI-BMT CLI.
+╭────────────────────────────────────────────╮
+│       ███╗   ███╗  ██████╗   █████╗        │
+│       ████╗ ████║ ██╔═══██╗ ██╔══██╗       │
+│       ██╔████╔██║ ██║   ██║ ███████║       │
+│       ██║╚██╔╝██║ ██║   ██║ ██╔══██║       │
+│       ██║ ╚═╝ ██║ ╚██████╔╝ ██║  ██║       │
+│       ╚═╝     ╚═╝  ╚═════╝  ╚═╝  ╚═╝       │
+│                                            │
+│              W O R K S H O P               │
+│                                            │
+│            AI-BMT @ MICRO 2026             │
+│  Round 2. Model Optimization Competition   │
+│       Gemma 4 12B on FuriosaAI RNGD        │
+│      https://micro2026-moa.github.io/      │
+╰────────────────────────────────────────────╯
+accuracy: queued on the NPU cluster as job 261516
+accuracy: running on the NPU
+remote_moa_entrypoint.sh: starting Gemma4 server on 127.0.0.1:8000
+remote_moa_entrypoint.sh: server is ready
+
+AI-BMT-MOA started
+─────────────── ACCURACY MODE ────────────────
+
+  Processing: 3 / 32 requests
+  Processing: 6 / 32 requests
+  Processing: 9 / 32 requests
+  Processing: 12 / 32 requests
+  Processing: 15 / 32 requests
+  Processing: 18 / 32 requests
+  Processing: 21 / 32 requests
+  Processing: 24 / 32 requests
+  Processing: 27 / 32 requests
+  Processing: 30 / 32 requests
+  Processing: 32 / 32 requests
+  Status: PASS
+  Accuracy: 32 / 32 cases passed (2 rounds)
+──────────────────────────────────────────────
+performance: queued on the NPU cluster as job 261522
+performance: running on the NPU
+remote_moa_entrypoint.sh: starting Gemma4 server on 127.0.0.1:8000
+remote_moa_entrypoint.sh: server is ready
+
+AI-BMT-MOA started
+────────────── PERFORMANCE MODE ──────────────
+
+  Warmup: 3 / 30 requests
+  Warmup: 6 / 30 requests
+  Warmup: 9 / 30 requests
+  Warmup: 12 / 30 requests
+  Warmup: 15 / 30 requests
+  Warmup: 18 / 30 requests
+  Warmup: 21 / 30 requests
+  Warmup: 24 / 30 requests
+  Warmup: 27 / 30 requests
+  Warmup: 30 / 30 requests
+  Measurement: 45 / 450 requests
+  Measurement: 90 / 450 requests
+  Measurement: 135 / 450 requests
+  Measurement: 180 / 450 requests
+  Measurement: 225 / 450 requests
+  Measurement: 270 / 450 requests
+  Measurement: 315 / 450 requests
+  Measurement: 360 / 450 requests
+  Measurement: 405 / 450 requests
+  Measurement: 450 / 450 requests
+  Performance
+    concurrency 30, repeat 3, 450 measured requests (after 30 warmup)
+
+    throughput     338.67 tokens/s   (5.31 requests/s)
+    TTFT p50/p90   1301.42 ms / 2310.10 ms
+    TPOT p50/p90   65.39 ms / 81.51 ms
+
+    split by input type:
+      256 text    TTFT 1118.00 ms / 2136.85 ms    TPOT 65.68 ms / 81.85 ms
+      1024 text   TTFT 1252.82 ms / 2165.44 ms    TPOT 64.84 ms / 81.78 ms
+      2048 text   TTFT 1425.96 ms / 2540.74 ms    TPOT 64.88 ms / 79.67 ms
+      512 image   TTFT 1342.04 ms / 2414.76 ms    TPOT 66.71 ms / 82.16 ms
+      768 audio   TTFT 1351.33 ms / 2408.17 ms    TPOT 64.77 ms / 81.17 ms
+──────────────────────────────────────────────
+Score: 338.6708 (generated tokens/s)
+Latency passed: TTFT p90 2.31 s <= 4.00 s, TPOT p90 81.5 ms <= 100.0 ms.
+Test run (--bin): not added to the leaderboard.
+submission completed

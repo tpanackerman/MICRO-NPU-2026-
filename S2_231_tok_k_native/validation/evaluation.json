@@ -1,0 +1,23 @@
+{
+  "candidate": "k_native",
+  "submission_id": "ad45834b",
+  "status": "completed [test]",
+  "score": 231.3123,
+  "kind": "test --bin",
+  "concurrency": 22,
+  "server_sha256": "83aefafb765140db1ea4684ed9cee91b1000de8c1fce18f54e694069bed3bbab",
+  "checked_at": "2026-10-11T12:44:36.393281+00:00",
+  "accuracy": {
+    "passed": 32,
+    "total": 32
+  },
+  "ttft_ms": {
+    "p50": 1648.72,
+    "p90": 2033.82
+  },
+  "tpot_ms": {
+    "p50": 66.99,
+    "p90": 72.51
+  },
+  "latency_passed": true
+}

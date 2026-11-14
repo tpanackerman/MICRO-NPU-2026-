@@ -1,0 +1,69 @@
+diff -ruN c64L10/source/src/host/chunkw.rs fi8/source/src/host/chunkw.rs
+--- c64L10/source/src/host/chunkw.rs	2026-10-15 14:23:52.000000000 +0700
++++ fi8/source/src/host/chunkw.rs	2026-10-15 21:12:15.370244900 +0700
+@@ -76,7 +76,8 @@
+         None
+     };
+     // px1 fbf: full-attention layers keep a once-decoded BF16 copy of the FFN (the native T = 256 full layer skips its Main decode pass)
+-    let bf = if packed::fbf_enabled() && layer % 6 == 5 {
++    // fi8: no bf16 copies for a full layer that runs int8 (saves ~330 MB HBM per layer)
++    let bf = if packed::fbf_enabled() && layer % 6 == 5 && !i8w::full_layer_on(layer) {
+         let (ub, gb, db) = std::thread::scope(|scope| {
+             let x = scope.spawn(|| packed::decode_f4_bf16(&a, &b, 128));
+             let y = scope.spawn(|| packed::decode_f4_bf16(&c, &d, 128));
+@@ -150,7 +151,8 @@
+             // all8b S3: full layers get int8 tensors too (the fold never applies to full layers in this build)
+             let ffn = match entry {
+                 ChunkLayer::Sliding { ffn, .. } => ffn,
+-                                ChunkLayer::Full { .. } => continue,
++                ChunkLayer::Full { ffn, .. } if i8w::full_layer_on(layer) => ffn,
++                ChunkLayer::Full { .. } => continue,
+             };
+             // fp8::ffn_fold, not ffn.fold.is_some(): the fold scale tensors are uploaded for EVERY layer when the fold is on (reserve layers too)
+             if !i8w::layer_on(layer) || fp8::ffn_fold(layer) {
+@@ -175,7 +177,7 @@
+             ffn.i8 = Some(i8w::upload(device, i8w::quantise(uw, us, ur, gw, gsc, gr, pre, sm.as_deref()), down_bf16).await?);
+             built += 1;
+         }
+-        eprintln!("S2 load: S2_I8_LAYERS int8 up/gate for {built} sliding layers {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
++        eprintln!("S2 load: S2_I8_LAYERS int8 up/gate for {built} layers (incl. full layers with S2_I8_FULL) {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
+     }
+     Ok(layers)
+ }
+diff -ruN c64L10/source/src/host/i8w.rs fi8/source/src/host/i8w.rs
+--- c64L10/source/src/host/i8w.rs	2026-10-15 11:17:50.000000000 +0700
++++ fi8/source/src/host/i8w.rs	2026-10-15 21:12:00.737962200 +0700
+@@ -110,7 +110,12 @@
+ }
+ 
+ /// all8b S3: full-attention layers of the allow-list get int8 too (`S2_I8_FULL` = 1 / on; default FULL_DEFAULT).
+-pub const FULL_DEFAULT: bool = false;
++/// fi8 (lever 4): int8 FFN on the full layers by default; `S2_I8_FULL=0` restores the bf16 (fbf) full layers.
++pub const FULL_DEFAULT: bool = true;
++/// fi8: the last layer (47, full) is excluded because its hybrid-pass K03 path (t16 / t8) is bf16; running it int8 only in non-K03 passes would be a per-pass arithmetic split.
++pub fn full_layer_on(layer: usize) -> bool {
++    full_on() && layer_on(layer) && layer != 47
++}
+ pub fn full_on() -> bool {
+     static ON: OnceLock<bool> = OnceLock::new();
+     *ON.get_or_init(|| match std::env::var("S2_I8_FULL").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+diff -ruN c64L10/source/src/host/runtime/hybrid256.rs fi8/source/src/host/runtime/hybrid256.rs
+--- c64L10/source/src/host/runtime/hybrid256.rs	2026-10-15 16:38:04.197841800 +0700
++++ fi8/source/src/host/runtime/hybrid256.rs	2026-10-15 21:12:00.779398100 +0700
+@@ -2040,7 +2040,15 @@
+                         // all8b v3: S3 (int8 full layer, ops_i8::layer_full_t256_i8) NOT dispatched: grader build budget (its image is not compiled when unreferenced)
+                         // px1 fbf: the native full layer always reads the once-decoded BF16 FFN weights (bit-identical to the run-time fp4 decode);
+                         // c64L8: `ops_fl::layer_full_t256r2` restored (default path, S2_FBF=0)
+-                        if let Some(bf) = ffn.bf.as_ref() {
++                        if let (true, Some(q)) = (i8w::full_layer_on(index), ffn.i8.as_ref()) {
++                            // fi8 (lever 4): int8 W8A8 up / gate + bf16 down on the full layer, the same body as the int8 sliding layers (`layer_full_pair_i8`)
++                            let lw = ops_i8::LayerW8F {
++                                w0: &ao.w[0], w1: &ao.w[1], w2: &ao.w[2], s0: &ao.s[0], s1: &ao.s[1], s2: &ao.s[2], post_attn_norm: &l.post_attention_norm, pre_w: q.pre_w.as_ref().unwrap_or(&ffn.pre_norm),
++                                up_q: &q.up_q, up_ws: &q.up_ws, gate_q: &q.gate_q, gate_ws: &q.gate_ws,
++                                down_w: &q.down_bf16, down_s: &ffn.down_s, dgs: &l.mlp.down_global_scale, post_ff: &l.post_feedforward_norm, had: &q.had,
++                            };
++                            prof::timed!("t_layer_f", lq_launch!(device, ops_i8::layer_full_t256_i8, (&attn, &lw, &l.layer_scalar, &rin, &mut rout), Slot::LayerF, &mut tick))?;
++                        } else if let Some(bf) = ffn.bf.as_ref() {
+                         prof::timed!("t_layer_f", lq_launch!(device, ops_fl::layer_full_t256r2bf, (&attn, &ao.w[0], &ao.w[1], &ao.w[2], &ao.s[0], &ao.s[1], &ao.s[2], &l.post_attention_norm, &rin,
+                                 &ffn.pre_norm, &bf.up, &l.ffc.up_gs, &bf.gate, &l.ffc.gate_gs,
+                                 &bf.down, &l.mlp.down_global_scale, &l.post_feedforward_norm, &l.ffc.layer_scalar, &mut rout), Slot::LayerF, &mut tick))?;

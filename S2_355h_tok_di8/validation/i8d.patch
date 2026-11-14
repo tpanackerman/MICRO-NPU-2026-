@@ -1,0 +1,1400 @@
+diff -ruN c64L10/source/src/device/int8/ffn.rs i8d/source/src/device/int8/ffn.rs
+--- c64L10/source/src/device/int8/ffn.rs	2026-10-15 11:17:50.000000000 +0700
++++ i8d/source/src/device/int8/ffn.rs	2026-10-16 11:41:52.905468200 +0700
+@@ -5,7 +5,7 @@
+ use furiosa_opt_std::prelude::*;
+ 
+ use crate::Chip;
+-use crate::axes::{Dummy8, H, Rh};
++use crate::axes::{Dummy8, Dummy16, H, Rh};
+ use crate::device::ffnc::norm::EPS;
+ use crate::device::ffnc::normp;
+ use crate::device::ffnc::{C32, C64, Dummy32, E32, E256, Fb8, Fb16, Fc2, Fh2, Fi4, Fi5, G32, Gd8, Rt80, Rt96, Rt240, Rt256, Tk128};
+@@ -593,6 +593,268 @@
+         .commit_view(buf.view_mut().tile::<m![Rh], 1, m![Rh = 1 #{!} 2, Tk128, Fi5, Rt96]>(half).tile::<m![Fi5], 1, m![Rh = 1 #{!} 2, Tk128, Fi5 = 1 #{!} 5, Rt96]>(i));
+ }
+ 
++// ---------------------------------------------------------------------------------------------------- i8d: int8 x int8 down projection
++// Weights (host `downi8`): int8 per (output row x 256-padded K chunk) of W' = W H / 32 (H32 along K inside the chunk, block 7 = 16 real + 16 zero
++// pad columns), f32 scale per (row, chunk) = s x (1 / global_scale) (the NVFP4 global down scale is FOLDED: no post-reduce `d_gs` multiply).
++// Activations: h quantised per (token, 256-chunk) with the `prenorm_q8` recipe (x' = H32 x per 32-block in bf16, s = sqrt(max x'^2 + 1e-30) / 127,
++// q = clip(round(x' / s), +-127)); the zero pad columns of h stay inside the rotation (H [x, 0] . H [w, 0] / 32 = x . w).
++// Contraction: int8 x int8 -> i32 per slice, x ws(row) x tk(token) in f32 on the per-slice partial, f32 inter-slice reduce over the 64 chunk slices.
++
++/// Exactly 1.0 per slice of the down layout (`0 x s + 1`), from the down token scales: the activation dependency of the down weight-scale VRFs.
++fn one8d_vrf(device: &mut Device, s: &DmTensor<f32, Chip, Cl8, Sl8, m![Tk128, 1 # 8]>) -> VrfTensor<f32, Chip, Cl8, Sl8, m![1 # 8]> {
++    let one: DmTensor<f32, Chip, Cl8, Sl8, m![1 # 8]> = device
++        .main
++        .begin(s.view().tile::<m![Tk128], 1, m![Tk128 = 1 # 128, 1 # 8]>(0))
++        .fetch::<m![1], m![1 # 8]>()
++        .collect::<m![1], m![1 # 8]>()
++        .vector_init()
++        .vector_intra_slice_tag(TagMode::Zero)
++        .vector_narrow_trim::<m![1 # 4]>()
++        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 0f32)
++        .vector_fp_binary(FpBinaryOp::AddF, 1f32)
++        .vector_widen_pad::<m![1 # 8]>()
++        .vector_final()
++        .commit_trim::<m![1 # 8]>()
++        .commit();
++    device.sub.begin(one.view()).fetch::<m![1], m![1 # 8]>().collect::<m![1], m![1 # 8]>().to_vrf()
++}
++
++/// = `ws_vrf` on the down layout: the per-(row, chunk) scales of one down tile through `x one8` (no hoisting into the up / gate phase).
++fn dws_vrf(
++    device: &mut Device,
++    ws: &DmTensor<f32, Chip, Cl8, Sl8, m![Rt96]>,
++    one8: &VrfTensor<f32, Chip, Cl8, Sl8, m![1 # 8]>,
++) -> VrfTensor<f32, Chip, Cl8, Sl8, m![Rt96]> {
++    let ws1: DmTensor<f32, Chip, Cl8, Sl8, m![Rt96]> = device
++        .main
++        .begin(ws.view())
++        .fetch::<m![Rt96 / 8], m![Rt96 % 8]>()
++        .collect::<m![Rt96 / 8], m![Rt96 % 8]>()
++        .vector_init()
++        .vector_intra_slice_tag(TagMode::Zero)
++        .vector_narrow_split::<m![Rt96 / 4], m![Rt96 % 4]>()
++        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), one8)
++        .vector_widen_concat::<m![Rt96 / 8], m![Rt96 % 8]>()
++        .vector_final()
++        .commit_trim::<m![Rt96 % 8]>()
++        .commit();
++    device.sub.begin(ws1.view()).fetch::<m![Rt96 / 8], m![Rt96 % 8]>().collect::<m![Rt96 / 8], m![Rt96 % 8]>().to_vrf()
++}
++
++/// int8 down tile (DM) -> TRF (Sub); 24 KiB per slice.
++fn ffd_trf_i8(device: &mut Device, w: &DmTensor<i8, Chip, Cl8, Sl8, m![Rt96, Rt256]>) -> TrfTensor<i8, Chip, Cl8, Sl8, m![Rt96 % 8], m![Rt96 / 8, Rt256]> {
++    device
++        .sub
++        .begin(w.view())
++        .fetch::<m![Rt96 % 8, Rt96 / 8, Rt256 / 32], m![Rt256 % 32]>()
++        .collect::<m![Rt96 % 8, Rt96 / 8, Rt256 / 32], m![Rt256 % 32]>()
++        .to_trf()
++}
++
++/// `ffd_con8` int8 x int8: both scales on the per-slice i32 partial (Mul0 = weight scale per row, Mul1 = token scale per (token, chunk)), then the f32
++/// reduce over the 64 chunk slices straight into `dbuf` (half `half`, tile `i`; no intermediate out tile, as `ffu_con_i8_sp`).
++#[allow(clippy::too_many_arguments)]
++fn ffd_con8_i8(
++    device: &mut Device,
++    x_q: &DmTensor<i8, Chip, Cl8, Sl8, m![Tk128, Rt256]>,
++    w_trf: &TrfTensor<i8, Chip, Cl8, Sl8, m![Rt96 % 8], m![Rt96 / 8, Rt256]>,
++    ws: &VrfTensor<f32, Chip, Cl8, Sl8, m![Rt96]>,
++    tk: &VrfTensor<f32, Chip, Cl8, Sl8, m![Tk128, 1 # 8]>,
++    buf: &mut DmTensor<bf16, Chip, Cl8, SlOut8, m![Rh, Tk128, Fi5, Rt96]>,
++    i: usize,
++    half: usize,
++) {
++    device
++        .main
++        .begin(x_q.view())
++        .fetch::<m![Tk128, Rt256 / 32], m![Rt256 % 32]>()
++        .collect::<m![Tk128, Rt256 / 32], m![Rt256 % 32]>()
++        .contract_outer::<m![Tk128, Rt256 / 64, Rt96 / 8], m![Rt256 % 64], _, _, _>(w_trf)
++        .contract_packet::<m![1]>()
++        .contract_time::<m![Tk128, Rt96 / 8]>()
++        .contract_lane::<m![Tk128, Rt96 / 8], m![Rt96 % 8]>(LaneMode::Interleaved)
++        .vector_init()
++        .vector_intra_slice_tag(TagMode::Zero)
++        .vector_fxp_to_fp(31)
++        .vector_narrow_split::<m![Tk128, Rt96 / 8, Rt96 / 4 % 2], m![Rt96 % 4]>()
++        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), ws)
++        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), tk)
++        .vector_widen_concat::<m![Tk128, Rt96 / 8], m![Rt96 % 8]>()
++        .vector_inter_slice_reduce::<SlOut8, m![Tk128, Rt96 / 8]>(InterSliceReduceOpF32::Add)
++        .vector_final()
++        .cast::<bf16, m![Rt96 % 8 # 16]>()
++        .commit_trim::<m![Rt96 % 8]>()
++        .commit_view(buf.view_mut().tile::<m![Rh], 1, m![Rh = 1 #{!} 2, Tk128, Fi5, Rt96]>(half).tile::<m![Fi5], 1, m![Rh = 1 #{!} 2, Tk128, Fi5 = 1 #{!} 5, Rt96]>(i));
++}
++
++// ---------------------------------------------------------------------------------------------------- i8d v2d: h quantised ONCE in layout Q, int8 hop
++// Layout Q: cluster = Tk128 / 64, slice = (Tk128 % 64 / 16, C64), [Tk128 % 16, Rt256] per slice (16 tokens x one 256-chunk): the per-(token, chunk)
++// rotation / absmax are intra-slice and every chunk is quantised once (v1 redid it on each of the 8 down replicas: +43k Main cycles). The bf16 h comes
++// in through ONE un-replicated contiguous load (8 KiB per slice), the int8 rows (4 KiB) and the f32 scales (512 B) leave in one contiguous run per slice,
++// and the down layout loads them replicated 8x (32 KiB + 4 KiB contiguous per slice) instead of the 64 KiB bf16 rows.
++// Quantising straight in the GeGLU layout (4 tokens of a chunk per slice) scheduled, but its scale store leaves in 128 B runs (static util 0.0098:
++// 19.7k DMA cycles per half for 256 KiB, attempts v2b / v2c). Values: identical to v1 (the same bf16 h, the same H32 / absmax / round recipe).
++type ClQ = m![Tk128 / 64];
++type SlQ = m![Tk128 % 64 / 16, C64];
++
++/// bf16 h of one half: GeGLU layout -> HBM `[G32, Fc2, Fh2, Tk128, Rt256]` (= `[C64, Tk128, Rt256]`) -> layout Q (un-replicated)
++fn hop_bf_q(device: &mut Device, h_buf: &DmTensor<bf16, Chip, Cl, SpSl, m![Fc2, Fh2, Tk128 % 4, Rt256]>) -> DmTensor<bf16, Chip, ClQ, SlQ, m![Tk128 % 16, Rt256]> {
++    let h: HbmTensor<bf16, Chip, m![G32, Fc2, Fh2, Tk128, Rt256]> = h_buf.to_hbm(&mut device.tdma);
++    let hv: HbmTensorView<'_, bf16, Chip, m![C64, Tk128, Rt256]> = unsafe { h.view().reshape() };
++    hv.to_dm(&mut device.tdma)
++}
++
++/// Exactly 1.0 per slice of layout Q from one token row of a hopped h (max of `0 x h + 1`): the activation dependency of the H32 TRF.
++fn one_q_vrf(device: &mut Device, h: &DmTensor<bf16, Chip, ClQ, SlQ, m![Tk128 % 16, Rt256]>) -> VrfTensor<f32, Chip, ClQ, SlQ, m![1 # 8]> {
++    let hv: DmTensorView<'_, bf16, Chip, ClQ, SlQ, m![Dummy16, Rt256]> = unsafe { h.view().reshape() };
++    let one: DmTensor<f32, Chip, ClQ, SlQ, m![1 # 8]> = device
++        .main
++        .begin(hv.tile::<m![Dummy16], 1, m![Dummy16 = 1 # 16, Rt256]>(0))
++        .fetch::<m![Rt256 / 16], m![Rt256 % 16]>()
++        .fetch_cast::<f32>()
++        .collect::<m![Rt256 / 8], m![Rt256 % 8]>()
++        .vector_init()
++        .vector_intra_slice_tag(TagMode::Zero)
++        .vector_narrow_split::<m![Rt256 / 4], m![Rt256 % 4]>()
++        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 0f32)
++        .vector_fp_binary(FpBinaryOp::AddF, 1f32)
++        .vector_intra_slice_reduce::<Rt256, m![1], m![1 # 4]>(IntraSliceReduceOpF32::Max)
++        .vector_widen_pad::<m![1 # 8]>()
++        .vector_final()
++        .commit_trim::<m![1 # 8]>()
++        .commit();
++    device.sub.begin(one.view()).fetch::<m![1], m![1 # 8]>().collect::<m![1], m![1 # 8]>().to_vrf()
++}
++
++/// The +-1 H32 matrix on layout Q (`HadT` = 512 identical contiguous 2 KiB copies), through `x one` (exact) so its TRF load is not hoisted.
++fn had_trf_q(
++    device: &mut Device,
++    had: &HadT,
++    one: &VrfTensor<f32, Chip, ClQ, SlQ, m![1 # 8]>,
++) -> TrfTensor<bf16, Chip, ClQ, SlQ, m![Ho32 % 8], m![Ho32 / 8, Rt256 % 32]> {
++    let hv: HbmTensorView<'_, bf16, Chip, m![Tk128 / 64, Tk128 % 64 / 16, C64, Ho32, Rt256 % 32]> = unsafe { had.view().reshape() };
++    let h_dm: DmTensor<bf16, Chip, ClQ, SlQ, m![Ho32, Rt256 % 32]> = hv.to_dm(&mut device.tdma);
++    let h1: DmTensor<bf16, Chip, ClQ, SlQ, m![Ho32, Rt256 % 32]> = device
++        .main
++        .begin(h_dm.view())
++        .fetch::<m![Ho32, Rt256 % 32 / 16], m![Rt256 % 16]>()
++        .fetch_cast::<f32>()
++        .collect::<m![Ho32, Rt256 % 32 / 8], m![Rt256 % 8]>()
++        .vector_init()
++        .vector_intra_slice_tag(TagMode::Zero)
++        .vector_narrow_split::<m![Ho32, Rt256 % 32 / 4], m![Rt256 % 4]>()
++        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), one)
++        .vector_widen_concat::<m![Ho32, Rt256 % 32 / 8], m![Rt256 % 8]>()
++        .vector_final()
++        .cast::<bf16, m![Rt256 % 8 # 16]>()
++        .commit_trim::<m![Rt256 % 8]>()
++        .commit();
++    device
++        .sub
++        .begin(h1.view())
++        .fetch::<m![Ho32 % 8, Ho32 / 8, Rt256 % 32 / 16], m![Rt256 % 16]>()
++        .collect::<m![Ho32 % 8, Ho32 / 8, Rt256 % 32 / 16], m![Rt256 % 16]>()
++        .to_trf()
++}
++
++/// = `rot32` on layout Q [Tk128 % 16, Rt256] (8 blocks of 32 per chunk; the 16 zero pad columns are inside block 7)
++fn rot32_q(
++    device: &mut Device,
++    x: &DmTensor<bf16, Chip, ClQ, SlQ, m![Tk128 % 16, Rt256]>,
++    h_trf: &TrfTensor<bf16, Chip, ClQ, SlQ, m![Ho32 % 8], m![Ho32 / 8, Rt256 % 32]>,
++) -> DmTensor<bf16, Chip, ClQ, SlQ, m![Tk128 % 16, Rt256]> {
++    let r: DmTensor<bf16, Chip, ClQ, SlQ, m![Tk128 % 16, Rt256 / 32, Ho32]> = device
++        .main
++        .begin(x.view())
++        .fetch::<m![Tk128 % 16, Rt256 / 16], m![Rt256 % 16]>()
++        .collect::<m![Tk128 % 16, Rt256 / 16], m![Rt256 % 16]>()
++        .contract_outer::<m![Tk128 % 16, Rt256 / 32, Ho32 / 8], m![Rt256 % 32], _, _, _>(h_trf)
++        .contract_packet::<m![1]>()
++        .contract_time::<m![Tk128 % 16, Rt256 / 32, Ho32 / 8]>()
++        .contract_lane::<m![Tk128 % 16, Rt256 / 32, Ho32 / 8], m![Ho32 % 8]>(LaneMode::Interleaved)
++        .cast::<bf16, m![Ho32 % 8 # 16]>()
++        .commit_trim::<m![Ho32 % 8]>()
++        .commit();
++    unsafe { r.reshape() }
++}
++
++/// = the `prenorm_q8` quantiser (after its rotation) on layout Q: (q i8 [Tk128 % 16, Rt256], s f32 per token of this chunk)
++#[allow(clippy::type_complexity)]
++fn q8_q(
++    device: &mut Device,
++    x_r: &DmTensor<bf16, Chip, ClQ, SlQ, m![Tk128 % 16, Rt256]>,
++) -> (DmTensor<i8, Chip, ClQ, SlQ, m![Tk128 % 16, Rt256]>, DmTensor<f32, Chip, ClQ, SlQ, m![Tk128 % 16, 1 # 8]>) {
++    let am2: DmTensor<f32, Chip, ClQ, SlQ, m![Tk128 % 16, 1 # 8]> = device
++        .main
++        .begin(x_r.view())
++        .fetch::<m![Tk128 % 16, Rt256 / 16], m![Rt256 % 16]>()
++        .fetch_cast::<f32>()
++        .collect::<m![Tk128 % 16, Rt256 / 8], m![Rt256 % 8]>()
++        .vector_init()
++        .vector_intra_slice_tag(TagMode::Zero)
++        .vector_narrow_split::<m![Tk128 % 16, Rt256 / 4], m![Rt256 % 4]>()
++        .vector_stash()
++        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), Stash)
++        .vector_intra_slice_reduce::<Rt256, m![Tk128 % 16], m![1 # 4]>(IntraSliceReduceOpF32::Max)
++        .vector_widen_pad::<m![1 # 8]>()
++        .vector_final()
++        .commit_trim::<m![1 # 8]>()
++        .commit();
++    let s: DmTensor<f32, Chip, ClQ, SlQ, m![Tk128 % 16, 1 # 8]> = device
++        .main
++        .begin(am2.view())
++        .fetch::<m![Tk128 % 16], m![1 # 8]>()
++        .collect::<m![Tk128 % 16], m![1 # 8]>()
++        .vector_init()
++        .vector_intra_slice_tag(TagMode::Zero)
++        .vector_narrow_trim::<m![1 # 4]>()
++        .vector_fp_binary(FpBinaryOp::AddF, TINY)
++        .vector_fp_unary(FpUnaryOp::Sqrt)
++        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), INV127)
++        .vector_widen_pad::<m![1 # 8]>()
++        .vector_final()
++        .commit_trim::<m![1 # 8]>()
++        .commit();
++    let s_vrf: VrfTensor<f32, Chip, ClQ, SlQ, m![Tk128 % 16, 1 # 8]> =
++        device.sub.begin(s.view()).fetch::<m![Tk128 % 16], m![1 # 8]>().collect::<m![Tk128 % 16], m![1 # 8]>().to_vrf();
++    let q: DmTensor<i8, Chip, ClQ, SlQ, m![Tk128 % 16, Rt256]> = device
++        .main
++        .begin(x_r.view())
++        .fetch::<m![Tk128 % 16, Rt256 / 16], m![Rt256 % 16]>()
++        .fetch_cast::<f32>()
++        .collect::<m![Tk128 % 16, Rt256 / 8], m![Rt256 % 8]>()
++        .vector_init()
++        .vector_intra_slice_tag(TagMode::Zero)
++        .vector_narrow_split::<m![Tk128 % 16, Rt256 / 4], m![Rt256 % 4]>()
++        .vector_fp_binary(FpBinaryOp::DivF, &s_vrf)
++        .vector_widen_concat::<m![Tk128 % 16, Rt256 / 8], m![Rt256 % 8]>()
++        .vector_fp_to_fxp(31)
++        .vector_clip(ClipBinaryOpI32::Min, 127i32)
++        .vector_clip(ClipBinaryOpI32::Max, -127i32)
++        .vector_final()
++        .cast::<i8, m![Rt256 % 8 # 32]>()
++        .commit_trim::<m![Rt256 % 8]>()
++        .commit();
++    (q, s)
++}
++
++/// int8 hop of one half: layout Q -> HBM (`[C64, Tk128, Rt256]` i8, `[C64, Tk128, Dummy8]` f32: one contiguous run per slice) -> down layout,
++/// replicated 8x (32 KiB + 4 KiB contiguous per slice).
++#[allow(clippy::type_complexity)]
++fn hop_i8_q(
++    device: &mut Device,
++    q: DmTensor<i8, Chip, ClQ, SlQ, m![Tk128 % 16, Rt256]>,
++    s: DmTensor<f32, Chip, ClQ, SlQ, m![Tk128 % 16, 1 # 8]>,
++) -> (DmTensor<i8, Chip, Cl8, Sl8, m![Tk128, Rt256]>, DmTensor<f32, Chip, Cl8, Sl8, m![Tk128, 1 # 8]>) {
++    let hq: HbmTensor<i8, Chip, m![C64, Tk128, Rt256]> = q.to_hbm(&mut device.tdma);
++    let xq: DmTensor<i8, Chip, Cl8, Sl8, m![Tk128, Rt256]> = hq.to_dm(&mut device.tdma);
++    let s8: DmTensor<f32, Chip, ClQ, SlQ, m![Tk128 % 16, Dummy8]> = unsafe { s.reshape() };
++    let hs: HbmTensor<f32, Chip, m![C64, Tk128, Dummy8]> = s8.to_hbm(&mut device.tdma);
++    let xs: DmTensor<f32, Chip, Cl8, Sl8, m![Tk128, Dummy8]> = hs.to_dm(&mut device.tdma);
++    let xs: DmTensor<f32, Chip, Cl8, Sl8, m![Tk128, 1 # 8]> = unsafe { xs.reshape() };
++    (xq, xs)
++}
++
+ /// = `ffn_mod!::geglu_pair_sp` (R15 overlap: each half has its OWN h buffer, so the down hop of half 0 does not wait for the GeGLU of half 1;
+ /// same arithmetic as `geglu_pair_sp_rh`, only the destination handle differs)
+ fn geglu_pair_sp_h(
+@@ -682,8 +944,8 @@
+     up_ws: &HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
+     gate_q: &HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
+     gate_ws: &HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
+-    down_w: &HbmTensor<bf16, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
+-    down_s: &HbmTensor<f8e4m3, Chip, m![Gd8, C64, Fi5, Rt96, Fb16]>,
++    down_w: &HbmTensor<i8, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
++    down_ws: &HbmTensor<f32, Chip, m![Gd8, C64, Fi5, Rt96]>,
+     dgs: &HbmTensor<f32, Chip, impl M>,
+     post_w: &HbmTensor<bf16, Chip, impl M>,
+     layer_scalar: &HbmTensor<bf16, Chip, impl M>,
+@@ -710,6 +972,7 @@
+     h_buf0.view_mut().memset(const { bf16::from_f32(0.0) }, &mut device.sub);
+     let mut h_buf1: DmTensor<bf16, Chip, Cl, SpSl, m![Fc2, Fh2, Tk128 % 4, Rt256]> = DmTensor::new();
+     h_buf1.view_mut().memset(const { bf16::from_f32(0.0) }, &mut device.sub);
++    #[allow(unused_macros)]
+     macro_rules! xh {
+         ($hb:ident) => {{
+             let h: HbmTensor<bf16, Chip, m![G32, Fc2, Fh2, Tk128, Rt256]> = $hb.to_hbm(&mut device.tdma);
+@@ -781,8 +1044,9 @@
+     let mut gate_p1: DmTensor<bf16, Chip, Cl, SpSl, m![Rh, Fh2, Tk128 % 4, Rt240]> = DmTensor::new();
+     mcon!(up_q, up_ws, 2, up_p1, 0);
+     mcon!(gate_q, gate_ws, 2, gate_p1, 0);
+-    let x_h0;
+-    let x_h1;
++    // i8d v2d: bf16 h hopped UN-replicated into layout Q right after each half's last GeGLU (as the base hop), quantised there once
++    let hb0;
++    let hb1;
+     {
+         // R15 overlap P8 (end skew): (up 3, gate 3) both TRF-resident, half 0 first -> GeGLU h0 -> the h0 down hop (DMA) runs under the half-1 contractions
+         // P8b: the weight-scale VRF is re-derived per half (a VRF live across the GeGLU's 7.5 KiB VRF cannot be evicted); the TRF tiles stay shared
+@@ -803,7 +1067,7 @@
+         let up0 = hcopy!(up_p1, 0);
+         let gate0 = hcopy!(gate_p1, 0);
+         geglu_pair_sp_h(device, up0, &gate0, &mut h_buf0, 1);
+-        x_h0 = xh!(h_buf0);
++        hb0 = hop_bf_q(device, &h_buf0);
+         {
+             let wa = ws_vrf(device, &wsa_dm, &one);
+             mc!(ta, wa, up_p1, 1, xq1, tk1, 1);
+@@ -815,16 +1079,44 @@
+         let up1 = hcopy!(up_p1, 1);
+         let gate1 = hcopy!(gate_p1, 1);
+         geglu_pair_sp_h(device, up1, &gate1, &mut h_buf1, 1);
+-        x_h1 = xh!(h_buf1);
++        hb1 = hop_bf_q(device, &h_buf1);
+     }
+-    let d_gs = scalar_vrf8(device, dgs);
++    // both quantisers after the LAST GeGLU, one H32 TRF anchored on half 1's hopped h. Quantising h0 right after its own GeGLU does not schedule:
++    // its H32 TRF (2 KiB) does not fit next to the two tile-3 up / gate TRFs (60 KiB, live for the half-1 contractions) and its scale VRF does not
++    // fit next to the half-1 GeGLU's 7,680 B VRF (attempt v2a: "Cannot find evict target for Trf / Vrf", as v1 without anchors)
++    let (dq0, ds0, dq1, ds1) = {
++        let one = one_q_vrf(device, &hb1);
++        let h_trf = had_trf_q(device, had, &one);
++        let r0 = rot32_q(device, &hb0, &h_trf);
++        let (q0, s0) = q8_q(device, &r0);
++        let (dq0, ds0) = hop_i8_q(device, q0, s0);
++        let r1 = rot32_q(device, &hb1, &h_trf);
++        let (q1, s1) = q8_q(device, &r1);
++        let (dq1, ds1) = hop_i8_q(device, q1, s1);
++        (dq0, ds0, dq1, ds1)
++    };
++    // i8d: int8 x int8 down. The global down scale is folded into `down_ws` on the host (`dgs` is no longer read by this body).
++    let _ = dgs;
++    // v2 anchor: 1.0 from half 0's hopped token scales (after the last GeGLU) -> the down weight-scale VRFs are not hoisted
++    let one8 = one8d_vrf(device, &ds0);
+     let mut dbuf: DmTensor<bf16, Chip, Cl8, SlOut8, m![Rh, Tk128, Fi5, Rt96]> = DmTensor::new();
+     macro_rules! dtile {
+         ($i:expr) => {{
+-            let w_dm: DmTensor<bf16, Chip, Cl8, Sl8, m![Rt96, Rt256]> = down_w.view().tile::<m![Fi5], 1, m![Gd8, C64, Fi5 = 1 # 5, Rt96, Rt256]>($i).to_dm(&mut device.tdma);
+-            let t = ffd_trf_bf16(device, &w_dm);
+-            ffd_con8(device, &x_h0, &t, &d_gs, &mut dbuf, $i, 0);
+-            ffd_con8(device, &x_h1, &t, &d_gs, &mut dbuf, $i, 1);
++            let w_dm: DmTensor<i8, Chip, Cl8, Sl8, m![Rt96, Rt256]> = down_w.view().tile::<m![Fi5], 1, m![Gd8, C64, Fi5 = 1 # 5, Rt96, Rt256]>($i).to_dm(&mut device.tdma);
++            let ws_dm: DmTensor<f32, Chip, Cl8, Sl8, m![Rt96]> = down_ws.view().tile::<m![Fi5], 1, m![Gd8, C64, Fi5 = 1 # 5, Rt96]>($i).to_dm(&mut device.tdma);
++            let t = ffd_trf_i8(device, &w_dm);
++            let wsv = dws_vrf(device, &ws_dm, &one8);
++            // the token-scale VRF of one half is 4 KiB (half the VRF): loaded per half, right before its contraction (= `mcon!`)
++            {
++                let tkv: VrfTensor<f32, Chip, Cl8, Sl8, m![Tk128, 1 # 8]> =
++                    device.sub.begin(ds0.view()).fetch::<m![Tk128], m![1 # 8]>().collect::<m![Tk128], m![1 # 8]>().to_vrf();
++                ffd_con8_i8(device, &dq0, &t, &wsv, &tkv, &mut dbuf, $i, 0);
++            }
++            {
++                let tkv: VrfTensor<f32, Chip, Cl8, Sl8, m![Tk128, 1 # 8]> =
++                    device.sub.begin(ds1.view()).fetch::<m![Tk128], m![1 # 8]>().collect::<m![Tk128], m![1 # 8]>().to_vrf();
++                ffd_con8_i8(device, &dq1, &t, &wsv, &tkv, &mut dbuf, $i, 1);
++            }
+         }};
+     }
+     dtile!(0);
+@@ -858,8 +1150,8 @@
+     up_ws: &HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
+     gate_q: &HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
+     gate_ws: &HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
+-    down_w: &HbmTensor<bf16, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
+-    down_s: &HbmTensor<f8e4m3, Chip, m![Gd8, C64, Fi5, Rt96, Fb16]>,
++    down_w: &HbmTensor<i8, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
++    down_ws: &HbmTensor<f32, Chip, m![Gd8, C64, Fi5, Rt96]>,
+     dgs: &HbmTensor<f32, Chip, impl M>,
+     post_ff: &HbmTensor<bf16, Chip, impl M>,
+     layer_scalar: &HbmTensor<bf16, Chip, impl M>,
+@@ -889,7 +1181,7 @@
+     let (mid0, mid_hbm0) = half!(0, attn0);
+     let (mid1, mid_hbm1) = half!(1, attn1);
+     let (out0, out1) = ffn_core_i8_pair(
+-        device, &mid_hbm0, &mid_hbm1, &mid0, &mid1, pre_w, up_q, up_ws, gate_q, gate_ws, down_w, down_s, dgs, post_ff, layer_scalar, had,
++        device, &mid_hbm0, &mid_hbm1, &mid0, &mid1, pre_w, up_q, up_ws, gate_q, gate_ws, down_w, down_ws, dgs, post_ff, layer_scalar, had,
+     );
+     macro_rules! store_half {
+         ($out:expr, $half:expr) => {{
+@@ -926,8 +1218,8 @@
+     up_ws: &HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
+     gate_q: &HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
+     gate_ws: &HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
+-    down_w: &HbmTensor<bf16, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
+-    down_s: &HbmTensor<f8e4m3, Chip, m![Gd8, C64, Fi5, Rt96, Fb16]>,
++    down_w: &HbmTensor<i8, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
++    down_ws: &HbmTensor<f32, Chip, m![Gd8, C64, Fi5, Rt96]>,
+     dgs: &HbmTensor<f32, Chip, impl M>,
+     post_ff: &HbmTensor<bf16, Chip, impl M>,
+     layer_scalar: &HbmTensor<bf16, Chip, impl M>,
+@@ -954,7 +1246,7 @@
+     let (mid0, mid_hbm0) = half!(0);
+     let (mid1, mid_hbm1) = half!(1);
+     let (out0, out1) = ffn_core_i8_pair(
+-        device, &mid_hbm0, &mid_hbm1, &mid0, &mid1, pre_w, up_q, up_ws, gate_q, gate_ws, down_w, down_s, dgs, post_ff, layer_scalar, had,
++        device, &mid_hbm0, &mid_hbm1, &mid0, &mid1, pre_w, up_q, up_ws, gate_q, gate_ws, down_w, down_ws, dgs, post_ff, layer_scalar, had,
+     );
+     macro_rules! store_half {
+         ($out:expr, $half:expr) => {{
+@@ -990,6 +1282,315 @@
+     up_ws: &HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
+     gate_q: &HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
+     gate_ws: &HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
++    down_w: &HbmTensor<i8, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
++    down_ws: &HbmTensor<f32, Chip, m![Gd8, C64, Fi5, Rt96]>,
++    dgs: &HbmTensor<f32, Chip, impl M>,
++    post_ff: &HbmTensor<bf16, Chip, impl M>,
++    layer_scalar: &HbmTensor<bf16, Chip, impl M>,
++    res_out: &mut HbmTensor<bf16, Chip, m![Rh, Tk128, C32, E32]>,
++    had: &HadT,
++) {
++    let mut zero_pad: DmTensor<bf16, Chip, TCl, m![{ Pre }, 1 # 2], m![C32 = 2, E32]> = DmTensor::new();
++    zero_pad.view_mut().memset(const { bf16::from_f32(0.0) }, &mut device.sub);
++    macro_rules! half {
++        ($half:expr) => {{
++            let res: DmTensor<bf16, Chip, TCl, m![{ Pre }, C32 = 30 / 15], m![C32 = 30 % 15, E32]> = res_in
++                .view()
++                .tile::<m![Rh], 1, m![Rh = 1 # 2, Tk128, C32, E32]>($half)
++                .tile::<m![C32], 30, m![Rh = 1 # 2, Tk128, C32 = 30 # 32, E32]>(0)
++                .to_dm(&mut device.tdma);
++            let res: PartDm = unsafe { res.reshape() };
++            let mid = crate::device::ffnc::ao::sliding_core_half8_t128(device, attn, $half, w0, w1, w2, s0, s1, s2, post_attn_norm, &res);
++            let mut mid_hbm: HbmTensor<bf16, Chip, m![Tk128, C32, E32]> = HbmTensor::new();
++            normp::p1920::store_rows::<Tk128, TCl, Pre>(device, &mid, &mut mid_hbm);
++            zero_pad.view().to_hbm_view(&mut device.tdma, mid_hbm.view_mut().tile::<m![C32], 2, m![Tk128, C32 = 2 #{!} 32, E32]>(30));
++            (mid, mid_hbm)
++        }};
++    }
++    let (mid0, mid_hbm0) = half!(0);
++    let (mid1, mid_hbm1) = half!(1);
++    let (out0, out1) = ffn_core_i8_pair(
++        device, &mid_hbm0, &mid_hbm1, &mid0, &mid1, pre_w, up_q, up_ws, gate_q, gate_ws, down_w, down_ws, dgs, post_ff, layer_scalar, had,
++    );
++    macro_rules! store_half {
++        ($out:expr, $half:expr) => {{
++            let xv: DmTensorView<'_, bf16, Chip, TCl, m![{ Pre }, C32 = 30 / 15], m![C32 = 30 % 15, E32]> = unsafe { $out.view().reshape() };
++            xv.to_hbm_view(
++                &mut device.tdma,
++                res_out
++                    .view_mut()
++                    .tile::<m![Rh], 1, m![Rh = 1 #{!} 2, Tk128, C32, E32]>($half)
++                    .tile::<m![C32], 30, m![Rh = 1 #{!} 2, Tk128, C32 = 30 #{!} 32, E32]>(0),
++            );
++        }};
++    }
++    store_half!(out0, 0);
++    store_half!(out1, 1);
++}
++
++// ---------------------------------------------------------------------------------------------------- i8d: the c64L10 bf16-down body (E2-type layers)
++// VERBATIM copies of c64L10's `ffn_core_i8_pair` / `layer_sliding_pair_v_i8` / `layer_sliding_pair_i8` (bf16 x bf16 down on the once-decoded `down_bf16`,
++// post-reduce `d_gs`). Used by the int8 layers whose NEXT layer is full attention (E2-type: 4, 10, 16, 22 with the default allow-list), statically per
++// layer in every entry they run through (`sliding_n3_layer_qkvf_b16_i8`, `sliding_n3_layer_b32_i8`, `layer_sliding_t256_i8b`): the E2 launch
++// (`*_qkvf_b16_i8`: + the full layer's quad QKV) does not schedule with the int8 down body (v1 and v2d alike: "Cannot find evict target for Vrf",
++// 3,932,160 B, DfsPostOrder step 400 / SethiUllman step 692 of ~16.2k).
++
++/// (T = 256, `S2_I8=A`) `ffn_core_d8_pair` with int8 up / gate: every int8 weight tile is loaded into the TRF ONCE and contracted against both halves.
++#[allow(clippy::too_many_arguments)]
++fn ffn_core_i8_pair_bfd(
++    device: &mut Device,
++    x_hbm0: &HbmTensor<bf16, Chip, m![Tk128, C32, E32]>,
++    x_hbm1: &HbmTensor<bf16, Chip, m![Tk128, C32, E32]>,
++    res0: &PartDm,
++    res1: &PartDm,
++    pre_w: &HbmTensor<bf16, Chip, m![C32, E32]>,
++    up_q: &HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
++    up_ws: &HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
++    gate_q: &HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
++    gate_ws: &HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
++    down_w: &HbmTensor<bf16, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
++    down_s: &HbmTensor<f8e4m3, Chip, m![Gd8, C64, Fi5, Rt96, Fb16]>,
++    dgs: &HbmTensor<f32, Chip, impl M>,
++    post_w: &HbmTensor<bf16, Chip, impl M>,
++    layer_scalar: &HbmTensor<bf16, Chip, impl M>,
++    had: &HadT,
++) -> (PartDm, PartDm) {
++    // R15 layout Q1: quantise once (un-replicated K-split layout), chunk-major int8 / scale stores, 1-byte replicated loads
++    let mut xq_hbm: XqHbm = HbmTensor::new();
++    let mut sq_hbm: SqHbm = HbmTensor::new();
++    q1_half(device, x_hbm0, pre_w, had, &mut xq_hbm, &mut sq_hbm, 0);
++    q1_half(device, x_hbm1, pre_w, had, &mut xq_hbm, &mut sq_hbm, 1);
++    let xq0: DmTensor<i8, Chip, Cl, Sl, m![Tk128, E32]> = xq_hbm.view().tile::<m![Rh], 1, m![C32, Rh = 1 # 2, Tk128, E32]>(0).to_dm(&mut device.tdma);
++    let tk0: DmTensor<f32, Chip, Cl, Sl, m![Tk128, Dummy8]> = sq_hbm.view().tile::<m![Rh], 1, m![C32, Rh = 1 # 2, Tk128, Dummy8]>(0).to_dm(&mut device.tdma);
++    let tk0: DmTensor<f32, Chip, Cl, Sl, m![Tk128, 1 # 8]> = unsafe { tk0.reshape() };
++    let xq1: DmTensor<i8, Chip, Cl, Sl, m![Tk128, E32]> = xq_hbm.view().tile::<m![Rh], 1, m![C32, Rh = 1 # 2, Tk128, E32]>(1).to_dm(&mut device.tdma);
++    let tk1: DmTensor<f32, Chip, Cl, Sl, m![Tk128, Dummy8]> = sq_hbm.view().tile::<m![Rh], 1, m![C32, Rh = 1 # 2, Tk128, Dummy8]>(1).to_dm(&mut device.tdma);
++    let tk1: DmTensor<f32, Chip, Cl, Sl, m![Tk128, 1 # 8]> = unsafe { tk1.reshape() };
++    // from half 1: the AO core of half 1 (7,680 B norm VRF) is independent of half 0's quantiser, so a half-0 anchor still lets the weight scales in early
++    let one = one_vrf(device, &tk1);
++
++    // R15 overlap (ffnpipe h1d1 in the fused int8 body): ONE h buffer PER HALF. With one shared handle the hop of half 0 (h -> HBM -> 8x replicate)
++    // waited for the last GeGLU of half 1 (an ordering through the handle, not a data dependency); with two handles it is issued right after the
++    // GeGLU of half 0 and runs on the DMA queue under the GeGLU of half 1 and the first down decode. Values are unchanged.
++    let mut h_buf0: DmTensor<bf16, Chip, Cl, SpSl, m![Fc2, Fh2, Tk128 % 4, Rt256]> = DmTensor::new();
++    h_buf0.view_mut().memset(const { bf16::from_f32(0.0) }, &mut device.sub);
++    let mut h_buf1: DmTensor<bf16, Chip, Cl, SpSl, m![Fc2, Fh2, Tk128 % 4, Rt256]> = DmTensor::new();
++    h_buf1.view_mut().memset(const { bf16::from_f32(0.0) }, &mut device.sub);
++    macro_rules! xh {
++        ($hb:ident) => {{
++            let h: HbmTensor<bf16, Chip, m![G32, Fc2, Fh2, Tk128, Rt256]> = $hb.to_hbm(&mut device.tdma);
++            let hv: HbmTensorView<'_, bf16, Chip, m![C64, Tk128, Rt256]> = unsafe { h.view().reshape() };
++            let x_h: DmTensor<bf16, Chip, Cl8, Sl8, m![Tk128, Rt256]> = hv.to_dm(&mut device.tdma);
++            x_h
++        }};
++    }
++    macro_rules! mcon {
++        ($q:ident, $ws:ident, $i:expr, $buf:ident, $h:expr) => {{
++            let w_dm: DmTensor<i8, Chip, Cl, Sl, m![Rt240, E32]> = $q.view().tile::<m![Fi4], 1, m![G32, C32, Fi4 = 1 # 4, Rt240, E32]>($i).to_dm(&mut device.tdma);
++            let ws_dm: DmTensor<f32, Chip, Cl, Sl, m![Rt240]> = $ws.view().tile::<m![Fi4], 1, m![G32, C32, Fi4 = 1 # 4, Rt240]>($i).to_dm(&mut device.tdma);
++            let t = ffu_trf_i8(device, &w_dm);
++            let wsv = ws_vrf(device, &ws_dm, &one);
++            // the token-chunk scale VRF of one half is 4 KiB (half the VRF): loaded per half, right before its contraction
++            {
++                let tkv: VrfTensor<f32, Chip, Cl, Sl, m![Tk128, 1 # 8]> =
++                    device.sub.begin(tk0.view()).fetch::<m![Tk128], m![1 # 8]>().collect::<m![Tk128], m![1 # 8]>().to_vrf();
++                ffu_con_i8_sp(device, &xq0, &t, &wsv, &tkv, &mut $buf, $h, 0);
++            }
++            {
++                let tkv: VrfTensor<f32, Chip, Cl, Sl, m![Tk128, 1 # 8]> =
++                    device.sub.begin(tk1.view()).fetch::<m![Tk128], m![1 # 8]>().collect::<m![Tk128], m![1 # 8]>().to_vrf();
++                ffu_con_i8_sp(device, &xq1, &t, &wsv, &tkv, &mut $buf, $h, 1);
++            }
++        }};
++    }
++    macro_rules! mload {
++        ($q:ident, $ws:ident, $i:expr) => {{
++            let w_dm: DmTensor<i8, Chip, Cl, Sl, m![Rt240, E32]> = $q.view().tile::<m![Fi4], 1, m![G32, C32, Fi4 = 1 # 4, Rt240, E32]>($i).to_dm(&mut device.tdma);
++            let ws_dm: DmTensor<f32, Chip, Cl, Sl, m![Rt240]> = $ws.view().tile::<m![Fi4], 1, m![G32, C32, Fi4 = 1 # 4, Rt240]>($i).to_dm(&mut device.tdma);
++            let t = ffu_trf_i8(device, &w_dm);
++            let wsv = ws_vrf(device, &ws_dm, &one);
++            (t, wsv)
++        }};
++    }
++    #[allow(unused_macros)]
++    macro_rules! mc {
++        ($t:ident, $wsv:ident, $buf:ident, $h:expr, $xq:ident, $tk:ident, $half:expr) => {{
++            let tkv: VrfTensor<f32, Chip, Cl, Sl, m![Tk128, 1 # 8]> =
++                device.sub.begin($tk.view()).fetch::<m![Tk128], m![1 # 8]>().collect::<m![Tk128], m![1 # 8]>().to_vrf();
++            ffu_con_i8_sp(device, &$xq, &$t, &$wsv, &tkv, &mut $buf, $h, $half);
++        }};
++    }
++    macro_rules! hcopy {
++        ($buf:ident, $half:expr) => {{
++            let mut t: DmTensor<bf16, Chip, Cl, SpSl, m![Fh2, Tk128 % 4, Rt240]> = DmTensor::new();
++            $buf.view().tile::<m![Rh], 1, m![Rh = 1 # 2, Fh2, Tk128 % 4, Rt240]>($half).to_dm_view(&mut device.tdma, t.view_mut());
++            t
++        }};
++    }
++    // ---- quad 0 (up / gate tiles 0, 1)
++    let mut up_p: DmTensor<bf16, Chip, Cl, SpSl, m![Rh, Fh2, Tk128 % 4, Rt240]> = DmTensor::new();
++    let mut gate_p: DmTensor<bf16, Chip, Cl, SpSl, m![Rh, Fh2, Tk128 % 4, Rt240]> = DmTensor::new();
++    mcon!(up_q, up_ws, 0, up_p, 0);
++    mcon!(gate_q, gate_ws, 0, gate_p, 0);
++    mcon!(up_q, up_ws, 1, up_p, 1);
++    mcon!(gate_q, gate_ws, 1, gate_p, 1);
++    {
++        let up0 = hcopy!(up_p, 0);
++        let gate0 = hcopy!(gate_p, 0);
++        geglu_pair_sp_h(device, up0, &gate0, &mut h_buf0, 0);
++        let up1 = hcopy!(up_p, 1);
++        let gate1 = hcopy!(gate_p, 1);
++        geglu_pair_sp_h(device, up1, &gate1, &mut h_buf1, 0);
++    }
++    // ---- quad 1 (tiles 2, 3); the down hop of each half is issued right after that half's last GeGLU
++    let mut up_p1: DmTensor<bf16, Chip, Cl, SpSl, m![Rh, Fh2, Tk128 % 4, Rt240]> = DmTensor::new();
++    let mut gate_p1: DmTensor<bf16, Chip, Cl, SpSl, m![Rh, Fh2, Tk128 % 4, Rt240]> = DmTensor::new();
++    mcon!(up_q, up_ws, 2, up_p1, 0);
++    mcon!(gate_q, gate_ws, 2, gate_p1, 0);
++    let x_h0;
++    let x_h1;
++    {
++        // R15 overlap P8 (end skew): (up 3, gate 3) both TRF-resident, half 0 first -> GeGLU h0 -> the h0 down hop (DMA) runs under the half-1 contractions
++        // P8b: the weight-scale VRF is re-derived per half (a VRF live across the GeGLU's 7.5 KiB VRF cannot be evicted); the TRF tiles stay shared
++        let wsa_dm: DmTensor<f32, Chip, Cl, Sl, m![Rt240]> = up_ws.view().tile::<m![Fi4], 1, m![G32, C32, Fi4 = 1 # 4, Rt240]>(3).to_dm(&mut device.tdma);
++        let wsb_dm: DmTensor<f32, Chip, Cl, Sl, m![Rt240]> = gate_ws.view().tile::<m![Fi4], 1, m![G32, C32, Fi4 = 1 # 4, Rt240]>(3).to_dm(&mut device.tdma);
++        let wa_dm: DmTensor<i8, Chip, Cl, Sl, m![Rt240, E32]> = up_q.view().tile::<m![Fi4], 1, m![G32, C32, Fi4 = 1 # 4, Rt240, E32]>(3).to_dm(&mut device.tdma);
++        let ta = ffu_trf_i8(device, &wa_dm);
++        let wb_dm: DmTensor<i8, Chip, Cl, Sl, m![Rt240, E32]> = gate_q.view().tile::<m![Fi4], 1, m![G32, C32, Fi4 = 1 # 4, Rt240, E32]>(3).to_dm(&mut device.tdma);
++        let tb = ffu_trf_i8(device, &wb_dm);
++        {
++            let wa = ws_vrf(device, &wsa_dm, &one);
++            mc!(ta, wa, up_p1, 1, xq0, tk0, 0);
++        }
++        {
++            let wb = ws_vrf(device, &wsb_dm, &one);
++            mc!(tb, wb, gate_p1, 1, xq0, tk0, 0);
++        }
++        let up0 = hcopy!(up_p1, 0);
++        let gate0 = hcopy!(gate_p1, 0);
++        geglu_pair_sp_h(device, up0, &gate0, &mut h_buf0, 1);
++        x_h0 = xh!(h_buf0);
++        {
++            let wa = ws_vrf(device, &wsa_dm, &one);
++            mc!(ta, wa, up_p1, 1, xq1, tk1, 1);
++        }
++        {
++            let wb = ws_vrf(device, &wsb_dm, &one);
++            mc!(tb, wb, gate_p1, 1, xq1, tk1, 1);
++        }
++        let up1 = hcopy!(up_p1, 1);
++        let gate1 = hcopy!(gate_p1, 1);
++        geglu_pair_sp_h(device, up1, &gate1, &mut h_buf1, 1);
++        x_h1 = xh!(h_buf1);
++    }
++    let d_gs = scalar_vrf8(device, dgs);
++    let mut dbuf: DmTensor<bf16, Chip, Cl8, SlOut8, m![Rh, Tk128, Fi5, Rt96]> = DmTensor::new();
++    macro_rules! dtile {
++        ($i:expr) => {{
++            let w_dm: DmTensor<bf16, Chip, Cl8, Sl8, m![Rt96, Rt256]> = down_w.view().tile::<m![Fi5], 1, m![Gd8, C64, Fi5 = 1 # 5, Rt96, Rt256]>($i).to_dm(&mut device.tdma);
++            let t = ffd_trf_bf16(device, &w_dm);
++            ffd_con8(device, &x_h0, &t, &d_gs, &mut dbuf, $i, 0);
++            ffd_con8(device, &x_h1, &t, &d_gs, &mut dbuf, $i, 1);
++        }};
++    }
++    dtile!(0);
++    dtile!(1);
++    dtile!(2);
++    dtile!(3);
++    dtile!(4);
++    let o0 = down_tail8_half(device, &dbuf, 0, res0, post_w, layer_scalar);
++    let o1 = down_tail8_half(device, &dbuf, 1, res1, post_w, layer_scalar);
++    (o0, o1)
++}
++
++/// (T = 256, `S2_I8=A`) = `f_t128::layer_sliding_pair_v` with the int8 up / gate body: AO of both halves from views of the attention output handles,
++/// mid rows through an HBM scratch (30 real chunks + 2 zero chunks), FFN, residual rows stored to `res_out`.
++/// R15 gapimpl F1: the attention rows arrive as the e4m3 AO8 input (`[C32, T, E]`, cast in the attention epilogue) -> `sliding_core_halfv8_t128`.
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn layer_sliding_pair_v_i8_bfd(
++    device: &mut Device,
++    attn0: HbmTensorView<'_, f8e4m3, Chip, m![C32, Tk128, E32]>,
++    attn1: HbmTensorView<'_, f8e4m3, Chip, m![C32, Tk128, E32]>,
++    w0: &HbmTensor<f8e4m3, Chip, m![G32, C32, Rt80, E32]>,
++    w1: &HbmTensor<f8e4m3, Chip, m![G32, C32, Rt80, E32]>,
++    w2: &HbmTensor<f8e4m3, Chip, m![G32, C32, Rt80, E32]>,
++    s0: &HbmTensor<bf16, Chip, m![G32, Rt80]>,
++    s1: &HbmTensor<bf16, Chip, m![G32, Rt80]>,
++    s2: &HbmTensor<bf16, Chip, m![G32, Rt80]>,
++    post_attn_norm: &HbmTensor<bf16, Chip, impl M>,
++    res_in: &HbmTensor<bf16, Chip, m![Rh, Tk128, C32, E32]>,
++    pre_w: &HbmTensor<bf16, Chip, m![C32, E32]>,
++    up_q: &HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
++    up_ws: &HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
++    gate_q: &HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
++    gate_ws: &HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
++    down_w: &HbmTensor<bf16, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
++    down_s: &HbmTensor<f8e4m3, Chip, m![Gd8, C64, Fi5, Rt96, Fb16]>,
++    dgs: &HbmTensor<f32, Chip, impl M>,
++    post_ff: &HbmTensor<bf16, Chip, impl M>,
++    layer_scalar: &HbmTensor<bf16, Chip, impl M>,
++    res_out: &mut HbmTensor<bf16, Chip, m![Rh, Tk128, C32, E32]>,
++    had: &HadT,
++) {
++    // one zero pad for both halves, written BEFORE the AO cores: a memset allocated after an AO re-shard DMA reused that DMA's source memory
++    // with no ordering (war4.py, Arm D lean: slack 0)
++    let mut zero_pad: DmTensor<bf16, Chip, TCl, m![{ Pre }, 1 # 2], m![C32 = 2, E32]> = DmTensor::new();
++    zero_pad.view_mut().memset(const { bf16::from_f32(0.0) }, &mut device.sub);
++    macro_rules! half {
++        ($half:expr, $attn:expr) => {{
++            let res: DmTensor<bf16, Chip, TCl, m![{ Pre }, C32 = 30 / 15], m![C32 = 30 % 15, E32]> = res_in
++                .view()
++                .tile::<m![Rh], 1, m![Rh = 1 # 2, Tk128, C32, E32]>($half)
++                .tile::<m![C32], 30, m![Rh = 1 # 2, Tk128, C32 = 30 # 32, E32]>(0)
++                .to_dm(&mut device.tdma);
++            let res: PartDm = unsafe { res.reshape() };
++            let mid = crate::device::ffnc::ao::sliding_core_halfv8_t128(device, $attn, w0, w1, w2, s0, s1, s2, post_attn_norm, &res);
++            // mid residual rows -> HBM scratch [T, C32, E32] (30 real chunks + 2 explicit zero chunks)
++            let mut mid_hbm: HbmTensor<bf16, Chip, m![Tk128, C32, E32]> = HbmTensor::new();
++            normp::p1920::store_rows::<Tk128, TCl, Pre>(device, &mid, &mut mid_hbm);
++            zero_pad.view().to_hbm_view(&mut device.tdma, mid_hbm.view_mut().tile::<m![C32], 2, m![Tk128, C32 = 2 #{!} 32, E32]>(30));
++            (mid, mid_hbm)
++        }};
++    }
++    let (mid0, mid_hbm0) = half!(0, attn0);
++    let (mid1, mid_hbm1) = half!(1, attn1);
++    let (out0, out1) = ffn_core_i8_pair_bfd(
++        device, &mid_hbm0, &mid_hbm1, &mid0, &mid1, pre_w, up_q, up_ws, gate_q, gate_ws, down_w, down_s, dgs, post_ff, layer_scalar, had,
++    );
++    macro_rules! store_half {
++        ($out:expr, $half:expr) => {{
++            let xv: DmTensorView<'_, bf16, Chip, TCl, m![{ Pre }, C32 = 30 / 15], m![C32 = 30 % 15, E32]> = unsafe { $out.view().reshape() };
++            xv.to_hbm_view(
++                &mut device.tdma,
++                res_out
++                    .view_mut()
++                    .tile::<m![Rh], 1, m![Rh = 1 #{!} 2, Tk128, C32, E32]>($half)
++                    .tile::<m![C32], 30, m![Rh = 1 #{!} 2, Tk128, C32 = 30 #{!} 32, E32]>(0),
++            );
++        }};
++    }
++    store_half!(out0, 0);
++    store_half!(out1, 1);
++}
++
++/// all8b S2: the int8 SLIDING layer from a whole [Rh, T, C32, E32] attention tensor (native T = 256 launch): AO8 half cores + the int8 FFN body.
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn layer_sliding_pair_i8_bfd(
++    device: &mut Device,
++    attn: &HbmTensor<bf16, Chip, m![Rh, Tk128, C32, E32]>,
++    w0: &HbmTensor<f8e4m3, Chip, m![G32, C32, Rt80, E32]>,
++    w1: &HbmTensor<f8e4m3, Chip, m![G32, C32, Rt80, E32]>,
++    w2: &HbmTensor<f8e4m3, Chip, m![G32, C32, Rt80, E32]>,
++    s0: &HbmTensor<bf16, Chip, m![G32, Rt80]>,
++    s1: &HbmTensor<bf16, Chip, m![G32, Rt80]>,
++    s2: &HbmTensor<bf16, Chip, m![G32, Rt80]>,
++    post_attn_norm: &HbmTensor<bf16, Chip, impl M>,
++    res_in: &HbmTensor<bf16, Chip, m![Rh, Tk128, C32, E32]>,
++    pre_w: &HbmTensor<bf16, Chip, m![C32, E32]>,
++    up_q: &HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
++    up_ws: &HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
++    gate_q: &HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
++    gate_ws: &HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
+     down_w: &HbmTensor<bf16, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
+     down_s: &HbmTensor<f8e4m3, Chip, m![Gd8, C64, Fi5, Rt96, Fb16]>,
+     dgs: &HbmTensor<f32, Chip, impl M>,
+@@ -1017,7 +1618,7 @@
+     }
+     let (mid0, mid_hbm0) = half!(0);
+     let (mid1, mid_hbm1) = half!(1);
+-    let (out0, out1) = ffn_core_i8_pair(
++    let (out0, out1) = ffn_core_i8_pair_bfd(
+         device, &mid_hbm0, &mid_hbm1, &mid0, &mid1, pre_w, up_q, up_ws, gate_q, gate_ws, down_w, down_s, dgs, post_ff, layer_scalar, had,
+     );
+     macro_rules! store_half {
+diff -ruN c64L10/source/src/host/chunkw.rs i8d/source/src/host/chunkw.rs
+--- c64L10/source/src/host/chunkw.rs	2026-10-15 14:23:52.000000000 +0700
++++ i8d/source/src/host/chunkw.rs	2026-10-16 11:36:13.756054800 +0700
+@@ -146,6 +146,9 @@
+     if i8w::on() {
+         let started = std::time::Instant::now();
+         let mut built = 0usize;
++        // i8d: the down format of an int8 layer is static per layer: bf16 (c64L10) when the next layer is full attention (E2-type), else int8
++        let next_full: Vec<bool> = (0..layers.len()).map(|l| matches!(layers.get(l + 1), Some(ChunkLayer::Full { .. }))).collect();
++        let mut built_bf16 = 0usize;
+         for (layer, entry) in layers.iter_mut().enumerate() {
+             // all8b S3: full layers get int8 tensors too (the fold never applies to full layers in this build)
+             let ffn = match entry {
+@@ -169,13 +172,22 @@
+             let (gw, gsc, gr) = (get("mlp.gate_proj.weight_packed")?, get("mlp.gate_proj.weight_scale")?, rgs("mlp.gate_proj.weight_global_scale")?);
+             let sm = i8w::smooth_exps(layer);
+             let pre = get("pre_feedforward_layernorm.weight")?;
+-            let down_bf16 = super::downbf16::decode(
+-                get("mlp.down_proj.weight_packed")?, get("mlp.down_proj.weight_scale")?,
+-            );
+-            ffn.i8 = Some(i8w::upload(device, i8w::quantise(uw, us, ur, gw, gsc, gr, pre, sm.as_deref()), down_bf16).await?);
++            // i8d: int8 down (H32-rotated, per (row, chunk) scale with the global scale folded in), or the c64L10 once-decoded bf16 copy for E2-type layers
++            let (dw4, ds8) = (get("mlp.down_proj.weight_packed")?, get("mlp.down_proj.weight_scale")?);
++            let down = if i8w::down_bf16_layer(next_full[layer]) {
++                built_bf16 += 1;
++                i8w::I8Down::Bf16(super::downbf16::decode(dw4, ds8))
++            } else {
++                let (q, ws) = super::downi8::quantise(dw4, ds8, rgs("mlp.down_proj.weight_global_scale")?);
++                i8w::I8Down::Int8(q, ws)
++            };
++            ffn.i8 = Some(i8w::upload(device, i8w::quantise(uw, us, ur, gw, gsc, gr, pre, sm.as_deref()), down).await?);
+             built += 1;
+         }
+-        eprintln!("S2 load: S2_I8_LAYERS int8 up/gate for {built} sliding layers {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
++        eprintln!(
++            "S2 load: S2_I8_LAYERS int8 up/gate for {built} sliding layers ({built_bf16} with the bf16 down: next layer full) {:.0} ms",
++            started.elapsed().as_secs_f64() * 1e3
++        );
+     }
+     Ok(layers)
+ }
+diff -ruN c64L10/source/src/host/downi8.rs i8d/source/src/host/downi8.rs
+--- c64L10/source/src/host/downi8.rs	1970-01-01 07:00:00.000000000 +0700
++++ i8d/source/src/host/downi8.rs	2026-10-15 21:08:19.867950400 +0700
+@@ -0,0 +1,229 @@
++//! i8d: int8 W8A8 down projection of the int8 (`S2_I8_LAYERS`) layers (replaces the once-decoded bf16 copy of `downbf16.rs` for the int8 body).
++//!
++//! Weights: int8 per (output row x K chunk of 240 real / 256 padded columns), symmetric, `s = amax / 127`, after a Hadamard-32 rotation along K
++//! inside each padded chunk (8 blocks of 32; block 7 = 16 real columns + the 16 zero pad columns). Same recipe as the int8 up / gate (`i8w::quant_groups`):
++//! the stored weight is W' = W H / 32 (unnormalised +-1 Sylvester H, the 1/32 exact) so that W' (H x) = W x, the device rotates the activation chunk by
++//! the same +-1 H (`device::int8::ffn`, `had32_bytes` matrix), and the uploaded f32 scale is `s x (1 / global_scale)`: the NVFP4 global down scale is
++//! FOLDED into the per-(row, chunk) scale (the device no longer multiplies the reduced sum by `down_global_scale`).
++//! Layout: int8 `[Gd8, C64, Fi5, Rt96, Rt256]` (the bf16 `down_bf16` order: output row = gd * 480 + tile * 96 + rr, K = chunk * 240 + j) and f32
++//! scales `[Gd8, C64, Fi5, Rt96]` (one per (row, chunk) group). Pure host code (std only), testable without the device crate.
++use super::fp8::e4m3_to_f32;
++
++/// e2m1 magnitudes by the low 3 bits of a nibble (bit 3 = sign).
++const F4: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
++const ROWS: usize = 3840;
++const K: usize = 15360;
++/// (row, chunk) groups of `[Gd8, C64, Fi5, Rt96]`
++pub(crate) const GROUPS: usize = 8 * 64 * 5 * 96;
++/// padded / real columns of one K chunk
++pub(crate) const CW: usize = 256;
++const CR: usize = 240;
++/// Hadamard block (= `i8w::HAD`)
++pub(crate) const HAD: usize = 32;
++
++/// v <- (H v) / HAD on each HAD-block (in-place fast Walsh-Hadamard transform, Sylvester order: (H v)_o = sum_i (-1)^popcount(o & i) v_i) = `i8w::had_rows`.
++pub(crate) fn had_rows(v: &mut [f32]) {
++    for blk in v.chunks_mut(HAD) {
++        let mut h = 1;
++        while h < HAD {
++            for i in (0..HAD).step_by(2 * h) {
++                for j in i..i + h {
++                    let (a, c) = (blk[j], blk[j + h]);
++                    blk[j] = a + c;
++                    blk[j + h] = a - c;
++                }
++            }
++            h *= 2;
++        }
++        for x in blk.iter_mut() {
++            *x /= HAD as f32;
++        }
++    }
++}
++
++/// Checkpoint row and K chunk of output group `og` of `[Gd8, C64, Fi5, Rt96]` (= `downbf16::decode_range`).
++fn src_of(og: usize) -> (usize, usize) {
++    let rr = og % 96;
++    let tile = og / 96 % 5;
++    let chunk = og / (96 * 5) % 64;
++    let gd = og / (96 * 5 * 64);
++    (gd * 480 + tile * 96 + rr, chunk)
++}
++
++/// The 256 padded chunk values `f4 x block_scale` of group `og` (240 real, 16 zero pads), read from the checkpoint tensors (f4 `[3840, 7680]` bytes,
++/// e4m3 block scales `[3840, 960]`).
++pub(crate) fn decode_group(w4: &[u8], s8: &[u8], og: usize) -> [f32; CW] {
++    let (row, chunk) = src_of(og);
++    let mut v = [0f32; CW];
++    for (j, vj) in v.iter_mut().enumerate().take(CR) {
++        let k = chunk * CR + j;
++        let b = w4[row * (K / 2) + k / 2];
++        let n = if k % 2 == 0 { b & 15 } else { b >> 4 };
++        let magnitude = F4[(n & 7) as usize] * e4m3_to_f32(s8[row * (K / 16) + k / 16]);
++        *vj = if n & 8 != 0 { -magnitude } else { magnitude };
++    }
++    v
++}
++
++/// int8 re-quantisation of the groups `[first, first + ws.len())`: `q` gets 256 bytes per group (rotated chunk order), `ws` one f32 per group
++/// (`s x rgs`, `rgs` = 1 / global scale). An all-zero group gives q = 0, ws = 0.
++pub(crate) fn quant_range(w4: &[u8], s8: &[u8], rgs: f32, first: usize, q: &mut [u8], ws: &mut [f32]) {
++    for (k, wsg) in ws.iter_mut().enumerate() {
++        let out = &mut q[k * CW..(k + 1) * CW];
++        let mut v = decode_group(w4, s8, first + k);
++        had_rows(&mut v);
++        let amax = v.iter().fold(0f32, |m, x| m.max(x.abs()));
++        if amax == 0.0 || !amax.is_finite() {
++            out.fill(0);
++            *wsg = 0.0;
++            continue;
++        }
++        let sc = amax / 127.0;
++        for j in 0..CW {
++            out[j] = ((v[j] / sc).round_ties_even().clamp(-127.0, 127.0) as i32) as i8 as u8;
++        }
++        *wsg = sc * rgs;
++    }
++}
++
++/// (int8 bytes `[Gd8, C64, Fi5, Rt96, Rt256]`, f32 scale bytes `[Gd8, C64, Fi5, Rt96]`) of one down matrix from its checkpoint tensors, on host threads.
++pub(crate) fn quantise(w4: &[u8], s8: &[u8], rgs: f32) -> (Vec<u8>, Vec<u8>) {
++    assert_eq!(w4.len(), ROWS * K / 2, "down f4 checkpoint size");
++    assert_eq!(s8.len(), ROWS * K / 16, "down scale checkpoint size");
++    let mut q = vec![0u8; GROUPS * CW];
++    let mut ws = vec![0f32; GROUPS];
++    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 8);
++    let per = GROUPS.div_ceil(workers);
++    std::thread::scope(|scope| {
++        for (i, (qc, wc)) in q.chunks_mut(per * CW).zip(ws.chunks_mut(per)).enumerate() {
++            scope.spawn(move || quant_range(w4, s8, rgs, i * per, qc, wc));
++        }
++    });
++    let ws_bytes = ws.iter().flat_map(|v| v.to_le_bytes()).collect();
++    (q, ws_bytes)
++}
++
++/// Device model of the activation side (`device::int8::ffn`, per (token, chunk)): x' = H x per 32-block (unnormalised, f32 sums, committed in bf16),
++/// s = sqrt(max x'^2 + 1e-30) / 127, q = clip(round(x' / s), +-127). Returns (q, s). Test helper.
++#[cfg(test)]
++pub(crate) fn act_quant(x: &[f32; CW]) -> ([i32; CW], f32) {
++    let bf = |v: f32| -> f32 {
++        let bits = v.to_bits();
++        f32::from_bits(((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) << 16)
++    };
++    let mut r = [0f32; CW];
++    for b in 0..CW / HAD {
++        for o in 0..HAD {
++            let mut acc = 0f32;
++            for i in 0..HAD {
++                let h = if (o & i).count_ones() % 2 == 0 { 1.0 } else { -1.0 };
++                acc += h * bf(x[b * HAD + i]);
++            }
++            r[b * HAD + o] = bf(acc);
++        }
++    }
++    let am2 = r.iter().fold(0f32, |m, v| m.max(v * v));
++    let s = (am2 + 1e-30).sqrt() * (1.0 / 127.0);
++    let mut q = [0i32; CW];
++    for j in 0..CW {
++        q[j] = ((r[j] / s).round_ties_even() as i32).clamp(-127, 127);
++    }
++    (q, s)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// xorshift64* (deterministic, no dependency)
++    struct Rng(u64);
++    impl Rng {
++        fn next(&mut self) -> u64 {
++            self.0 ^= self.0 >> 12;
++            self.0 ^= self.0 << 25;
++            self.0 ^= self.0 >> 27;
++            self.0.wrapping_mul(0x2545F4914F6CDD1D)
++        }
++        fn unit(&mut self) -> f32 {
++            (self.next() >> 40) as f32 / (1u64 << 24) as f32
++        }
++        fn normal(&mut self) -> f32 {
++            let (a, b) = (self.unit().max(1e-7), self.unit());
++            (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()
++        }
++    }
++
++    #[test]
++    fn had_rows_matches_device_matrix() {
++        // the FWHT is H v / 32 with H[o][i] = (-1)^popcount(o & i): the +-1 matrix the device gets from `i8w::had32_bytes`
++        let mut rng = Rng(7);
++        let x: Vec<f32> = (0..HAD).map(|_| rng.normal()).collect();
++        let mut y = x.clone();
++        had_rows(&mut y);
++        for o in 0..HAD {
++            let want: f32 = (0..HAD).map(|i| if (o & i).count_ones() % 2 == 0 { x[i] } else { -x[i] }).sum::<f32>() / HAD as f32;
++            assert!((y[o] - want).abs() < 1e-5, "row {o}: {} vs {want}", y[o]);
++        }
++    }
++
++    /// dequant(quant(rot(w))) . (s_x q_x) ~ w . x on random checkpoint-like data (f4 x e4m3 weights, heavy-tailed activations with zero pads),
++    /// group order / scale fold / pad handling through the real `quant_range` on a full-size synthetic checkpoint slice.
++    #[test]
++    fn down_quant_roundtrip() {
++        let mut rng = Rng(0x1234_5678_9abc_def1);
++        // a full-size checkpoint (the group -> row / chunk addressing is exercised for real); random nibbles, block scales 2^-3 .. 2^3 (e4m3 0x20..0x50)
++        let w4: Vec<u8> = (0..ROWS * K / 2).map(|_| rng.next() as u8).collect();
++        let s8: Vec<u8> = (0..ROWS * K / 16).map(|_| 0x20 + (rng.next() % 0x31) as u8).collect();
++        let rgs = 1.0 / 20864.0;
++        let mut worst = 0f64;
++        let mut sum_rel2 = 0f64;
++        let mut n = 0usize;
++        for &og in &[0usize, 1, 95, 96, 479, 480, 12345, 77777, 122_879, 122_880, 200_000, GROUPS - 1] {
++            let mut q = vec![0u8; CW];
++            let mut ws = vec![0f32; 1];
++            quant_range(&w4, &s8, rgs, og, &mut q, &mut ws);
++            let w = decode_group(&w4, &s8, og);
++            assert!(w[CR..].iter().all(|&v| v == 0.0), "pad columns must be zero");
++            // the group's row / chunk: compare against the checkpoint directly
++            let (row, chunk) = src_of(og);
++            let k0 = chunk * CR + 7;
++            let b = w4[row * (K / 2) + k0 / 2];
++            let nib = if k0 % 2 == 0 { b & 15 } else { b >> 4 };
++            let direct = F4[(nib & 7) as usize] * e4m3_to_f32(s8[row * (K / 16) + k0 / 16]) * if nib & 8 != 0 { -1.0 } else { 1.0 };
++            assert_eq!(w[7], direct, "group {og}: decode addressing");
++            for trial in 0..4 {
++                // activations: gelu-like (mostly small, a few outliers), real columns only (pads stay 0 as on the device)
++                let mut x = [0f32; CW];
++                for (j, xj) in x.iter_mut().enumerate().take(CR) {
++                    let g = rng.normal();
++                    *xj = if rng.unit() < 0.02 { g * 20.0 } else { g * 0.3 } + if trial == 3 && j == 5 { 300.0 } else { 0.0 };
++                }
++                let want: f64 = (0..CW).map(|j| w[j] as f64 * x[j] as f64).sum::<f64>() * rgs as f64;
++                let (qx, sx) = act_quant(&x);
++                let got: f64 = (0..CW).map(|j| (q[j] as i8 as i64) * qx[j] as i64).sum::<i64>() as f64 * ws[0] as f64 * sx as f64;
++                // scale of the error: |w| |x| (Cauchy-Schwarz bound of the dot product)
++                let wn: f64 = (0..CW).map(|j| (w[j] as f64).powi(2)).sum::<f64>().sqrt() * rgs as f64;
++                let xn: f64 = (0..CW).map(|j| (x[j] as f64).powi(2)).sum::<f64>().sqrt();
++                let rel = (got - want).abs() / (wn * xn).max(1e-30);
++                worst = worst.max(rel);
++                sum_rel2 += rel * rel;
++                n += 1;
++            }
++            // all-zero group -> q = 0, ws = 0
++        }
++        let rms = (sum_rel2 / n as f64).sqrt();
++        eprintln!("down_quant_roundtrip: {n} dots, error / (|w||x|): rms {rms:.2e}, worst {worst:.2e}");
++        assert!(worst < 2e-2, "worst relative error {worst}");
++        assert!(rms < 8e-3, "rms relative error {rms}");
++    }
++
++    #[test]
++    fn zero_group() {
++        let w4 = vec![0u8; ROWS * K / 2];
++        let s8 = vec![0x38u8; ROWS * K / 16];
++        let mut q = vec![1u8; CW];
++        let mut ws = vec![1f32; 1];
++        quant_range(&w4, &s8, 1.0, 5, &mut q, &mut ws);
++        assert!(q.iter().all(|&b| b == 0) && ws[0] == 0.0);
++    }
++}
+diff -ruN c64L10/source/src/host/i8w.rs i8d/source/src/host/i8w.rs
+--- c64L10/source/src/host/i8w.rs	2026-10-15 11:17:50.000000000 +0700
++++ i8d/source/src/host/i8w.rs	2026-10-16 11:36:13.747055200 +0700
+@@ -23,8 +23,14 @@
+ 
+ /// int8 up / gate tensors of one sliding layer.
+ pub struct I8Ffn {
+-    /// Once-decoded original down weights, without folding the global scale.
+-    pub down_bf16: HbmTensor<bf16, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
++    /// i8d: the down weights in ONE static format per layer (decided at load, `I8Down`): int8 (`down_q` + `down_ws`, every int8 layer but the E2-type
++    /// ones) or the c64L10 once-decoded bf16 copy (`down_bf16`, E2-type layers = next layer full attention). Exactly one of the two is Some.
++    /// int8 down weights per (output row x 256-padded K chunk), H32-rotated along K (`host::downi8`)
++    pub down_q: Option<HbmTensor<i8, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>>,
++    /// f32 scale per (output row x K chunk) with the NVFP4 global down scale folded in (`s x 1 / global_scale`)
++    pub down_ws: Option<HbmTensor<f32, Chip, m![Gd8, C64, Fi5, Rt96]>>,
++    /// once-decoded original down weights, without folding the global scale (= c64L10)
++    pub down_bf16: Option<HbmTensor<bf16, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>>,
+     pub up_q: HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
+     pub up_ws: HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
+     pub gate_q: HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
+@@ -317,14 +323,39 @@
+ }
+ 
+ /// Uploads the int8 tensors of one layer (called AFTER the layer's provided tensors are uploaded, so the bf16 weights keep their addresses).
+-pub async fn upload(device: &mut Device, bytes: I8Bytes, down_bf16: Vec<u8>) -> Result<I8Ffn, BoxError> {
++/// i8d: host bytes of the down weights of one int8 layer, in its static format.
++pub enum I8Down {
++    /// (int8 bytes, f32 scale bytes) of `host::downi8::quantise`
++    Int8(Vec<u8>, Vec<u8>),
++    /// `host::downbf16::decode` (the c64L10 bytes)
++    Bf16(Vec<u8>),
++}
++
++/// i8d: the int8 layers whose down projection stays the c64L10 bf16 one: the E2-type layers, i.e. the next layer is a full-attention layer (their
++/// fused launch `ops_i8::sliding_n3_layer_qkvf_b16_i8` does not schedule with the int8 down). STATIC per layer: every launch of such a layer
++/// (E2 b16 / b32, the K'-slot fallback and the unfused native T = 256 pass) reads the same bf16 down (`ops_i8::LayerW8B`).
++pub fn down_bf16_layer(next_is_full: bool) -> bool {
++    next_is_full
++}
++
++pub async fn upload(device: &mut Device, bytes: I8Bytes, down: I8Down) -> Result<I8Ffn, BoxError> {
+     let I8Bytes(uq, uws, gq, gws, pre) = bytes;
++    let (down_q, down_ws, down_bf16) = match down {
++        I8Down::Int8(dq, dws) => (
++            Some(HostTensor::<i8, m![Gd8, C64, Fi5, Rt96, Rt256]>::from_buf(dq).to_hbm(&mut device.pdma).await?),
++            Some(HostTensor::<f32, m![Gd8, C64, Fi5, Rt96]>::from_buf(dws).to_hbm(&mut device.pdma).await?),
++            None,
++        ),
++        I8Down::Bf16(b) => (None, None, Some(HostTensor::<bf16, m![Gd8, C64, Fi5, Rt96, Rt256]>::from_buf(b).to_hbm(&mut device.pdma).await?)),
++    };
+     let pre_w = match pre {
+         Some(b) => Some(HostTensor::<bf16, m![C32, E32]>::from_buf(b).to_hbm(&mut device.pdma).await?),
+         None => None,
+     };
+     Ok(I8Ffn {
+-        down_bf16: HostTensor::<bf16, m![Gd8, C64, Fi5, Rt96, Rt256]>::from_buf(down_bf16).to_hbm(&mut device.pdma).await?,
++        down_q,
++        down_ws,
++        down_bf16,
+         pre_w,
+         had: crate::device::int8::ffn::HadHost::from_buf(had32_bytes().repeat(512)).to_hbm(&mut device.pdma).await?,
+         up_q: HostTensor::<i8, m![G32, C32, Fi4, Rt240, E32]>::from_buf(uq).to_hbm(&mut device.pdma).await?,
+diff -ruN c64L10/source/src/host/mod.rs i8d/source/src/host/mod.rs
+--- c64L10/source/src/host/mod.rs	2026-10-15 11:17:50.000000000 +0700
++++ i8d/source/src/host/mod.rs	2026-10-16 11:36:13.764055400 +0700
+@@ -22,3 +22,4 @@
+ pub mod worker;
+ 
+ mod downbf16;
++mod downi8;
+diff -ruN c64L10/source/src/host/runtime/hybrid256.rs i8d/source/src/host/runtime/hybrid256.rs
+--- c64L10/source/src/host/runtime/hybrid256.rs	2026-10-15 16:38:04.197841800 +0700
++++ i8d/source/src/host/runtime/hybrid256.rs	2026-10-16 11:36:13.779062600 +0700
+@@ -1518,11 +1518,11 @@
+                         };
+                         // S2_I8_LAYERS (default OFF; int8 tensors exist only for allow-listed, non-folded sliding layers): the int8 K REPLACES the bf16 K of this layer;
+                         // not next-fusable => the bf16 path below (there is no int8 K')
+-                        let lwi = match (lw8.is_none() && next_ok, ffn.i8.as_ref()) {
++                        let lwi = match (lw8.is_none() && next_ok, ffn.i8.as_ref().filter(|q| q.down_q.is_some())) {
+                             (true, Some(q)) => Some(ops_i8::LayerW8 {
+                                 w0: &ao.w[0], w1: &ao.w[1], w2: &ao.w[2], s0: &ao.s[0], s1: &ao.s[1], s2: &ao.s[2], post_attn_norm: &l.rep.post_attention_norm, pre_w: q.pre_w.as_ref().unwrap_or(&ffn.pre_norm),
+                                 up_q: &q.up_q, up_ws: &q.up_ws, gate_q: &q.gate_q, gate_ws: &q.gate_ws,
+-                                down_w: &q.down_bf16, down_s: &ffn.down_s, dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
++                                down_w: q.down_q.as_ref().expect("int8 down"), down_ws: q.down_ws.as_ref().expect("int8 down"), dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
+                             }),
+                             _ => None,
+                         };
+@@ -1568,11 +1568,12 @@
+                                     let mut fvo: HbmTensor<bf16, Chip, m![Ub, Tc, Df]> = piece(&self.v_f, 0)?;
+                                     let mut o80: HbmTensor<f8e4m3, Chip, crate::device::rpa::prefill_kvd256::O8P0> = piece(&self.out8_s, 0)?;
+                                     let mut o81: HbmTensor<f8e4m3, Chip, crate::device::rpa::prefill_kvd256::O8P1> = piece(&self.out8_s, 1)?;
+-                                    let lwk = if fp8::ffn_fold(index) || !i8w::native_on() { None } else { ffn.i8.as_ref().map(|q| ops_i8::LayerW8 {
++                                    // i8d: E2-type layer (next = full) -> its static bf16 down (`LayerW8B`, = the c64L10 construction); an int8-down layer never takes E2
++                                    let lwk = if fp8::ffn_fold(index) || !i8w::native_on() { None } else { ffn.i8.as_ref().and_then(|q| q.down_bf16.as_ref().map(|dbf| ops_i8::LayerW8B {
+                                         w0: &ao.w[0], w1: &ao.w[1], w2: &ao.w[2], s0: &ao.s[0], s1: &ao.s[1], s2: &ao.s[2], post_attn_norm: &l.rep.post_attention_norm, pre_w: q.pre_w.as_ref().unwrap_or(&ffn.pre_norm),
+                                         up_q: &q.up_q, up_ws: &q.up_ws, gate_q: &q.gate_q, gate_ws: &q.gate_ws,
+-                                        down_w: &q.down_bf16, down_s: &ffn.down_s, dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
+-                                    }) };
++                                        down_w: dbf, down_s: &ffn.down_s, dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
++                                    })) };
+                                     if let Some(lwk) = lwk.as_ref() {
+                                         let _ = (&qf, &mut fqo, &mut fko, &mut fvo);
+                                         prof::timed!("t_e2_i8", lq_launch!(device, ops_i8::sliding_n3_layer_b32_i8, (&n3in, lwk, &l.rep.layer_scalar, &rin, &mut o80, &mut o81, &mut rout)))?;
+@@ -1594,13 +1595,21 @@
+                             prof::timed!("t_attn_s1", lq_launch!(device, ops_fl::sliding_n3_attention_b32, (&n3in, &mut o0, &mut o1)))?;
+                             let attn: HbmTensor<bf16, Chip, m![Rh, Tk128, Kc, Ke]> = piece(&self.out_s, 0)?;
+                             // all8b S2: an int8 layer in the K' slot runs the int8 native layer
+-                            let lw_i8 = if fp8::ffn_fold(index) || !i8w::native_on() { None } else { ffn.i8.as_ref().map(|q| ops_i8::LayerW8 {
++                            let lw_i8 = if fp8::ffn_fold(index) || !i8w::native_on() { None } else { ffn.i8.as_ref().filter(|q| q.down_q.is_some()).map(|q| ops_i8::LayerW8 {
+                                 w0: &ao.w[0], w1: &ao.w[1], w2: &ao.w[2], s0: &ao.s[0], s1: &ao.s[1], s2: &ao.s[2], post_attn_norm: &l.rep.post_attention_norm, pre_w: q.pre_w.as_ref().unwrap_or(&ffn.pre_norm),
+                                 up_q: &q.up_q, up_ws: &q.up_ws, gate_q: &q.gate_q, gate_ws: &q.gate_ws,
+-                                down_w: &q.down_bf16, down_s: &ffn.down_s, dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
++                                down_w: q.down_q.as_ref().expect("int8 down"), down_ws: q.down_ws.as_ref().expect("int8 down"), dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
+                             }) };
++                            // i8d: an E2-type layer that does not take E2 here keeps its static bf16 down
++                            let lw_i8b = if fp8::ffn_fold(index) || !i8w::native_on() { None } else { ffn.i8.as_ref().and_then(|q| q.down_bf16.as_ref().map(|dbf| ops_i8::LayerW8B {
++                                w0: &ao.w[0], w1: &ao.w[1], w2: &ao.w[2], s0: &ao.s[0], s1: &ao.s[1], s2: &ao.s[2], post_attn_norm: &l.rep.post_attention_norm, pre_w: q.pre_w.as_ref().unwrap_or(&ffn.pre_norm),
++                                up_q: &q.up_q, up_ws: &q.up_ws, gate_q: &q.gate_q, gate_ws: &q.gate_ws,
++                                down_w: dbf, down_s: &ffn.down_s, dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
++                            })) };
+                             if let Some(lw_i8) = lw_i8.as_ref() {
+                                 prof::timed!("t_layer_i8_s1", lq_launch!(device, ops_i8::layer_sliding_t256_i8, (&attn, lw_i8, &l.rep.layer_scalar, &rin, &mut rout)))?;
++                            } else if let Some(lw_i8b) = lw_i8b.as_ref() {
++                                prof::timed!("t_layer_i8_s1", lq_launch!(device, ops_i8::layer_sliding_t256_i8b, (&attn, lw_i8b, &l.rep.layer_scalar, &rin, &mut rout)))?;
+                             } else if let (true, Some(f), Some(w8)) = (lw8.is_some(), ffn.fold.as_ref(), ffn.fold.as_ref().and_then(|f| f.w8.as_ref())) {
+                                 prof::timed!("t_layer8_s1", lq_launch!(device, ops_f8::layer_sliding_t256_f8pb, (&attn, &ao.w[0], &ao.w[1], &ao.w[2], &ao.s[0], &ao.s[1], &ao.s[2], &l.rep.post_attention_norm, &rin, &l.rep.pre_feedforward_norm, &w8.up, &f.up_gs_r, &w8.gate, &f.gate_gs_r, &w8.down, &f.down_gs, &l.rep.post_feedforward_norm, &l.rep.layer_scalar, &mut rout)))?;
+                             } else {
+@@ -1664,11 +1673,11 @@
+                         };
+                         // S2_I8_LAYERS (default OFF; int8 tensors exist only for allow-listed, non-folded sliding layers): the int8 K REPLACES the bf16 K of this layer;
+                         // not next-fusable => the bf16 path below (there is no int8 K')
+-                        let lwi = match (lw8.is_none() && next_ok, ffn.i8.as_ref()) {
++                        let lwi = match (lw8.is_none() && next_ok, ffn.i8.as_ref().filter(|q| q.down_q.is_some())) {
+                             (true, Some(q)) => Some(ops_i8::LayerW8 {
+                                 w0: &ao.w[0], w1: &ao.w[1], w2: &ao.w[2], s0: &ao.s[0], s1: &ao.s[1], s2: &ao.s[2], post_attn_norm: &l.rep.post_attention_norm, pre_w: q.pre_w.as_ref().unwrap_or(&ffn.pre_norm),
+                                 up_q: &q.up_q, up_ws: &q.up_ws, gate_q: &q.gate_q, gate_ws: &q.gate_ws,
+-                                down_w: &q.down_bf16, down_s: &ffn.down_s, dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
++                                down_w: q.down_q.as_ref().expect("int8 down"), down_ws: q.down_ws.as_ref().expect("int8 down"), dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
+                             }),
+                             _ => None,
+                         };
+@@ -1715,11 +1724,12 @@
+                                     let mut fvo: HbmTensor<bf16, Chip, m![Ub, Tc, Df]> = piece(&self.v_f, 0)?;
+                                     let mut o80: HbmTensor<f8e4m3, Chip, crate::device::rpa::prefill_kvd256::O8P0> = piece(&self.out8_s, 0)?;
+                                     let mut o81: HbmTensor<f8e4m3, Chip, crate::device::rpa::prefill_kvd256::O8P1> = piece(&self.out8_s, 1)?;
+-                                    let lwk = if fp8::ffn_fold(index) || !i8w::native_on() { None } else { ffn.i8.as_ref().map(|q| ops_i8::LayerW8 {
++                                    // i8d: E2-type layer (next = full) -> its static bf16 down (`LayerW8B`, = the c64L10 construction); an int8-down layer never takes E2
++                                    let lwk = if fp8::ffn_fold(index) || !i8w::native_on() { None } else { ffn.i8.as_ref().and_then(|q| q.down_bf16.as_ref().map(|dbf| ops_i8::LayerW8B {
+                                         w0: &ao.w[0], w1: &ao.w[1], w2: &ao.w[2], s0: &ao.s[0], s1: &ao.s[1], s2: &ao.s[2], post_attn_norm: &l.rep.post_attention_norm, pre_w: q.pre_w.as_ref().unwrap_or(&ffn.pre_norm),
+                                         up_q: &q.up_q, up_ws: &q.up_ws, gate_q: &q.gate_q, gate_ws: &q.gate_ws,
+-                                        down_w: &q.down_bf16, down_s: &ffn.down_s, dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
+-                                    }) };
++                                        down_w: dbf, down_s: &ffn.down_s, dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
++                                    })) };
+                                     if let Some(lwk) = lwk.as_ref() {
+                                         prof::timed!("t_e2_i8", lq_launch!(device, ops_i8::sliding_n3_layer_qkvf_b16_i8, (&n3in, lwk, &l.rep.layer_scalar, &rin, &mut o80, &mut o81, &mut rout, &qf, &mut *xnq, &mut fqo, &mut fko, &mut fvo)))?;
+                                         e2_done = true;
+@@ -1739,13 +1749,21 @@
+                             prof::timed!("t_attn_s1", lq_launch!(device, ops_rpa::sliding_ragged_s4_b16_kvd_blk, (&q0, &q1, &win[0], &win[1], &t.s.mask[0], &t.s.pen[0], &t.s.mask[1], &t.s.pen[1], &mut o0, &mut o1, &q_d, bidx, bmask, &*fk, &*fv, &kb, &vb)))?;
+                             let attn: HbmTensor<bf16, Chip, m![Rh, Tk128, Kc, Ke]> = piece(&self.out_s, 0)?;
+                             // all8b S2: an int8 layer in the K' slot runs the int8 native layer
+-                            let lw_i8 = if fp8::ffn_fold(index) || !i8w::native_on() { None } else { ffn.i8.as_ref().map(|q| ops_i8::LayerW8 {
++                            let lw_i8 = if fp8::ffn_fold(index) || !i8w::native_on() { None } else { ffn.i8.as_ref().filter(|q| q.down_q.is_some()).map(|q| ops_i8::LayerW8 {
+                                 w0: &ao.w[0], w1: &ao.w[1], w2: &ao.w[2], s0: &ao.s[0], s1: &ao.s[1], s2: &ao.s[2], post_attn_norm: &l.rep.post_attention_norm, pre_w: q.pre_w.as_ref().unwrap_or(&ffn.pre_norm),
+                                 up_q: &q.up_q, up_ws: &q.up_ws, gate_q: &q.gate_q, gate_ws: &q.gate_ws,
+-                                down_w: &q.down_bf16, down_s: &ffn.down_s, dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
++                                down_w: q.down_q.as_ref().expect("int8 down"), down_ws: q.down_ws.as_ref().expect("int8 down"), dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
+                             }) };
++                            // i8d: an E2-type layer that does not take E2 here keeps its static bf16 down
++                            let lw_i8b = if fp8::ffn_fold(index) || !i8w::native_on() { None } else { ffn.i8.as_ref().and_then(|q| q.down_bf16.as_ref().map(|dbf| ops_i8::LayerW8B {
++                                w0: &ao.w[0], w1: &ao.w[1], w2: &ao.w[2], s0: &ao.s[0], s1: &ao.s[1], s2: &ao.s[2], post_attn_norm: &l.rep.post_attention_norm, pre_w: q.pre_w.as_ref().unwrap_or(&ffn.pre_norm),
++                                up_q: &q.up_q, up_ws: &q.up_ws, gate_q: &q.gate_q, gate_ws: &q.gate_ws,
++                                down_w: dbf, down_s: &ffn.down_s, dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
++                            })) };
+                             if let Some(lw_i8) = lw_i8.as_ref() {
+                                 prof::timed!("t_layer_i8_s1", lq_launch!(device, ops_i8::layer_sliding_t256_i8, (&attn, lw_i8, &l.rep.layer_scalar, &rin, &mut rout)))?;
++                            } else if let Some(lw_i8b) = lw_i8b.as_ref() {
++                                prof::timed!("t_layer_i8_s1", lq_launch!(device, ops_i8::layer_sliding_t256_i8b, (&attn, lw_i8b, &l.rep.layer_scalar, &rin, &mut rout)))?;
+                             } else if let (true, Some(f), Some(w8)) = (lw8.is_some(), ffn.fold.as_ref(), ffn.fold.as_ref().and_then(|f| f.w8.as_ref())) {
+                                 prof::timed!("t_layer8_s1", lq_launch!(device, ops_f8::layer_sliding_t256_f8pb, (&attn, &ao.w[0], &ao.w[1], &ao.w[2], &ao.s[0], &ao.s[1], &ao.s[2], &l.rep.post_attention_norm, &rin,
+                                         &l.rep.pre_feedforward_norm, &w8.up, &f.up_gs_r, &w8.gate, &f.gate_gs_r,
+@@ -1892,12 +1910,22 @@
+                         let attn: HbmTensor<bf16, Chip, m![Rh, Tk128, Kc, Ke]> = piece(&self.out_s, 0)?;
+                         let rin: HbmTensor<bf16, Chip, m![Rh, Tk128, Kc, Ke]> = piece(res_in, 0)?;
+                         let mut rout: HbmTensor<bf16, Chip, m![Rh, Tk128, Kc, Ke]> = piece(&*res_out, 0)?;
++                        // i8d: the layer's static down format (int8, or the c64L10 bf16 for E2-type layers)
++                        if let Some(dbf) = q.down_bf16.as_ref() {
++                            let lw_i8b = ops_i8::LayerW8B {
++                                w0: &ao.w[0], w1: &ao.w[1], w2: &ao.w[2], s0: &ao.s[0], s1: &ao.s[1], s2: &ao.s[2], post_attn_norm: &l.rep.post_attention_norm, pre_w: q.pre_w.as_ref().unwrap_or(&ffn.pre_norm),
++                                up_q: &q.up_q, up_ws: &q.up_ws, gate_q: &q.gate_q, gate_ws: &q.gate_ws,
++                                down_w: dbf, down_s: &ffn.down_s, dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
++                            };
++                            prof::timed!("t_layer_i8_s", lq_launch!(device, ops_i8::layer_sliding_t256_i8b, (&attn, &lw_i8b, &l.rep.layer_scalar, &rin, &mut rout), Slot::LayerS, &mut tick))?;
++                        } else {
+                         let lw_i8 = ops_i8::LayerW8 {
+                                 w0: &ao.w[0], w1: &ao.w[1], w2: &ao.w[2], s0: &ao.s[0], s1: &ao.s[1], s2: &ao.s[2], post_attn_norm: &l.rep.post_attention_norm, pre_w: q.pre_w.as_ref().unwrap_or(&ffn.pre_norm),
+                                 up_q: &q.up_q, up_ws: &q.up_ws, gate_q: &q.gate_q, gate_ws: &q.gate_ws,
+-                                down_w: &q.down_bf16, down_s: &ffn.down_s, dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
++                                down_w: q.down_q.as_ref().expect("int8 down"), down_ws: q.down_ws.as_ref().expect("int8 down"), dgs: &l.mlp.down_global_scale, post_ff: &l.rep.post_feedforward_norm, had: &q.had,
+                             };
+                         prof::timed!("t_layer_i8_s", lq_launch!(device, ops_i8::layer_sliding_t256_i8, (&attn, &lw_i8, &l.rep.layer_scalar, &rin, &mut rout), Slot::LayerS, &mut tick))?;
++                        }
+                     } else if native256bf() && !fp8::ffn_fold(index) {
+                         // NATIVE T = 256, bf16 FFN: ONE launch for the 256 rows, every up / gate / down weight tile decoded and loaded into the TRF once (`ops_ffnc::layer_sliding_t256p`,
+                         // the same per-token arithmetic as the two `layer_sliding_t128` launches)
+diff -ruN c64L10/source/src/ops_i8.rs i8d/source/src/ops_i8.rs
+--- c64L10/source/src/ops_i8.rs	2026-10-15 13:04:11.000000000 +0700
++++ i8d/source/src/ops_i8.rs	2026-10-16 11:35:16.849219500 +0700
+@@ -24,6 +24,31 @@
+     pub up_ws: &'a HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
+     pub gate_q: &'a HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
+     pub gate_ws: &'a HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
++    /// i8d: int8 down weights (H32-rotated along K, host `downi8`) + f32 scale per (row, chunk) with the global down scale folded in
++    pub down_w: &'a HbmTensor<i8, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
++    pub down_ws: &'a HbmTensor<f32, Chip, m![Gd8, C64, Fi5, Rt96]>,
++    pub dgs: &'a HbmTensor<f32, Chip, m![1]>,
++    pub post_ff: &'a crate::device::ffnc::NormRep,
++    /// all8b: the +-1 Hadamard-32 matrix of the activation rotation (host `i8w::had32_bytes`)
++    pub had: &'a int8::ffn::HadT,
++}
++
++/// i8d: = the c64L10 `LayerW8` (int8 up / gate, once-decoded bf16 down + f8 block scales + global scale): the weights of an E2-type int8 layer (next layer
++/// = full attention), which keeps the c64L10 bf16 down in every entry it runs through (`*_qkvf_b16_i8`, `*_b32_i8`, `layer_sliding_t256_i8b`).
++#[derive(DeviceSend)]
++pub struct LayerW8B<'a> {
++    pub w0: &'a HbmTensor<f8e4m3, Chip, m![G32, C32, Rt80, E32]>,
++    pub w1: &'a HbmTensor<f8e4m3, Chip, m![G32, C32, Rt80, E32]>,
++    pub w2: &'a HbmTensor<f8e4m3, Chip, m![G32, C32, Rt80, E32]>,
++    pub s0: &'a HbmTensor<bf16, Chip, m![G32, Rt80]>,
++    pub s1: &'a HbmTensor<bf16, Chip, m![G32, Rt80]>,
++    pub s2: &'a HbmTensor<bf16, Chip, m![G32, Rt80]>,
++    pub post_attn_norm: &'a crate::device::ffnc::NormRep,
++    pub pre_w: &'a HbmTensor<bf16, Chip, m![C32, E32]>,
++    pub up_q: &'a HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
++    pub up_ws: &'a HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
++    pub gate_q: &'a HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
++    pub gate_ws: &'a HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
+     pub down_w: &'a HbmTensor<bf16, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
+     pub down_s: &'a HbmTensor<f8e4m3, Chip, m![Gd8, C64, Fi5, Rt96, Fb16]>,
+     pub dgs: &'a HbmTensor<f32, Chip, m![1]>,
+@@ -34,6 +59,29 @@
+ 
+ type Res = HbmTensor<bf16, Chip, m![Rh, Tk128, C32, E32]>;
+ 
++/// i8d: = the c64L10 `n3_layer_i8` (bf16-down body) for an E2-type layer.
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn n3_layer_i8_bfd(
++    device: &mut Device,
++    n: &N3In16<'_>,
++    w: &LayerW8B<'_>,
++    layer_scalar: &crate::device::ffnc::ScalarRep,
++    res_in: &Res,
++    out_p0: &mut HbmTensor<f8e4m3, Chip, rpa::prefill_kvd256::O8P0>,
++    out_p1: &mut HbmTensor<f8e4m3, Chip, rpa::prefill_kvd256::O8P1>,
++    res_out: &mut Res,
++) {
++    rpa::prefill_kvd256::ragged_prefill_pair_kvd256_o8(device, n.q_p0, n.k_cache, n.v_cache, n.win0, n.mask_p0, n.pen_p0, out_p0);
++    rpa::prefill_kvd256::ragged_prefill_pair_kvd256_r16_o8(device, n.q_p1, n.k_cache, n.v_cache, n.win1, n.mask_p1, n.pen_p1, out_p1);
++    dattn::sliding_blk::sliding_decode_attend16_blk_view_o8(device, n.q_d, n.k_blk, n.v_blk, n.index_d, n.mask_d, out_p1);
++    let a0: HbmTensorView<'_, f8e4m3, Chip, m![C32, Tk128, E32]> = unsafe { out_p0.view().reshape() };
++    let a1: HbmTensorView<'_, f8e4m3, Chip, m![C32, Tk128, E32]> = unsafe { out_p1.view().reshape() };
++    int8::ffn::layer_sliding_pair_v_i8_bfd(
++        device, a0, a1, w.w0, w.w1, w.w2, w.s0, w.s1, w.s2, w.post_attn_norm, res_in, w.pre_w, w.up_q, w.up_ws, w.gate_q, w.gate_ws, w.down_w, w.down_s, w.dgs,
++        w.post_ff, layer_scalar, res_out, w.had,
++    );
++}
++
+ 
+ #[allow(clippy::too_many_arguments)]
+ pub(crate) fn n3_layer_i8(
+@@ -53,7 +101,7 @@
+     let a0: HbmTensorView<'_, f8e4m3, Chip, m![C32, Tk128, E32]> = unsafe { out_p0.view().reshape() };
+     let a1: HbmTensorView<'_, f8e4m3, Chip, m![C32, Tk128, E32]> = unsafe { out_p1.view().reshape() };
+     int8::ffn::layer_sliding_pair_v_i8(
+-        device, a0, a1, w.w0, w.w1, w.w2, w.s0, w.s1, w.s2, w.post_attn_norm, res_in, w.pre_w, w.up_q, w.up_ws, w.gate_q, w.gate_ws, w.down_w, w.down_s, w.dgs,
++        device, a0, a1, w.w0, w.w1, w.w2, w.s0, w.s1, w.s2, w.post_attn_norm, res_in, w.pre_w, w.up_q, w.up_ws, w.gate_q, w.gate_ws, w.down_w, w.down_ws, w.dgs,
+         w.post_ff, layer_scalar, res_out, w.had,
+     );
+ }
+@@ -110,7 +158,7 @@
+ pub fn sliding_n3_layer_qkvf_b16_i8(
+     device: &mut Device,
+     n: &N3In16<'_>,
+-    w: &LayerW8<'_>,
++    w: &LayerW8B<'_>,
+     layer_scalar: &crate::device::ffnc::ScalarRep,
+     res_in: &Res,
+     out_p0: &mut HbmTensor<f8e4m3, Chip, rpa::prefill_kvd256::O8P0>,
+@@ -122,7 +170,8 @@
+     k_out: &mut HbmTensor<bf16, Chip, m![Ub, Tc, Df]>,
+     v_out: &mut HbmTensor<bf16, Chip, m![Ub, Tc, Df]>,
+ ) {
+-    n3_layer_i8(device, n, w, layer_scalar, res_in, out_p0, out_p1, res_out);
++    // i8d: the c64L10 bf16-down body (this launch does not schedule with the int8 down: VRF, see `int8::ffn::ffn_core_i8_pair_bfd`)
++    n3_layer_i8_bfd(device, n, w, layer_scalar, res_in, out_p0, out_p1, res_out);
+     let x: HbmTensorView<'_, bf16, Chip, m![Ub, Tc, Kc, Ke]> = unsafe { res_out.view().reshape() };
+     crate::qkv8::quad_full_sel(device, x, qf.input_norm, xn, qf.wq, qf.sq, qf.wk, qf.sk, qf.q_norm, qf.k_norm, qf.cos, qf.sin, q_out, k_out, v_out);
+ }
+@@ -140,6 +189,23 @@
+     res_out: &mut Res,
+ ) {
+     int8::ffn::layer_sliding_pair_i8(
++        device, attn, w.w0, w.w1, w.w2, w.s0, w.s1, w.s2, w.post_attn_norm, res_in, w.pre_w, w.up_q, w.up_ws, w.gate_q, w.gate_ws, w.down_w, w.down_ws, w.dgs,
++        w.post_ff, layer_scalar, res_out, w.had,
++    );
++}
++
++/// i8d: `layer_sliding_t256_i8` with the c64L10 bf16-down body, for the E2-type int8 layers (their down format is bf16 in every pass shape).
++#[device(chip = 1)]
++#[allow(clippy::too_many_arguments)]
++pub fn layer_sliding_t256_i8b(
++    device: &mut Device,
++    attn: &HbmTensor<bf16, Chip, m![Rh, Tk128, C32, E32]>,
++    w: &LayerW8B<'_>,
++    layer_scalar: &crate::device::ffnc::ScalarRep,
++    res_in: &Res,
++    res_out: &mut Res,
++) {
++    int8::ffn::layer_sliding_pair_i8_bfd(
+         device, attn, w.w0, w.w1, w.w2, w.s0, w.s1, w.s2, w.post_attn_norm, res_in, w.pre_w, w.up_q, w.up_ws, w.gate_q, w.gate_ws, w.down_w, w.down_s, w.dgs,
+         w.post_ff, layer_scalar, res_out, w.had,
+     );
+@@ -160,8 +226,9 @@
+     pub up_ws: &'a HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
+     pub gate_q: &'a HbmTensor<i8, Chip, m![G32, C32, Fi4, Rt240, E32]>,
+     pub gate_ws: &'a HbmTensor<f32, Chip, m![G32, C32, Fi4, Rt240]>,
+-    pub down_w: &'a HbmTensor<bf16, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
+-    pub down_s: &'a HbmTensor<f8e4m3, Chip, m![Gd8, C64, Fi5, Rt96, Fb16]>,
++    /// i8d: int8 down weights (H32-rotated along K, host `downi8`) + f32 scale per (row, chunk) with the global down scale folded in
++    pub down_w: &'a HbmTensor<i8, Chip, m![Gd8, C64, Fi5, Rt96, Rt256]>,
++    pub down_ws: &'a HbmTensor<f32, Chip, m![Gd8, C64, Fi5, Rt96]>,
+     pub dgs: &'a HbmTensor<f32, Chip, m![1]>,
+     pub post_ff: &'a HbmTensor<bf16, Chip, m![H]>,
+     pub had: &'a int8::ffn::HadT,
+@@ -178,7 +245,7 @@
+     res_out: &mut Res,
+ ) {
+     int8::ffn::layer_full_pair_i8(
+-        device, attn, w.w0, w.w1, w.w2, w.s0, w.s1, w.s2, w.post_attn_norm, res_in, w.pre_w, w.up_q, w.up_ws, w.gate_q, w.gate_ws, w.down_w, w.down_s, w.dgs,
++        device, attn, w.w0, w.w1, w.w2, w.s0, w.s1, w.s2, w.post_attn_norm, res_in, w.pre_w, w.up_q, w.up_ws, w.gate_q, w.gate_ws, w.down_w, w.down_ws, w.dgs,
+         w.post_ff, layer_scalar, res_out, w.had,
+     );
+ }
+@@ -202,6 +269,29 @@
+     let a0: HbmTensorView<'_, f8e4m3, Chip, m![C32, Tk128, E32]> = unsafe { out_p0.view().reshape() };
+     let a1: HbmTensorView<'_, f8e4m3, Chip, m![C32, Tk128, E32]> = unsafe { out_p1.view().reshape() };
+     int8::ffn::layer_sliding_pair_v_i8(
++        device, a0, a1, w.w0, w.w1, w.w2, w.s0, w.s1, w.s2, w.post_attn_norm, res_in, w.pre_w, w.up_q, w.up_ws, w.gate_q, w.gate_ws, w.down_w, w.down_ws, w.dgs,
++        w.post_ff, layer_scalar, res_out, w.had,
++    );
++}
++/// i8d: = the c64L10 `n3_layer_i8_32` (bf16-down body) for an E2-type layer.
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn n3_layer_i8_32_bfd(
++    device: &mut Device,
++    n: &crate::ops_fl::N3In32<'_>,
++    w: &LayerW8B<'_>,
++    layer_scalar: &crate::device::ffnc::ScalarRep,
++    res_in: &Res,
++    out_p0: &mut HbmTensor<f8e4m3, Chip, rpa::prefill_kvd256::O8P0>,
++    out_p1: &mut HbmTensor<f8e4m3, Chip, rpa::prefill_kvd256::O8P1>,
++    res_out: &mut Res,
++) {
++    rpa::prefill_kvd256::ragged_prefill_pair_kvd256_o8(device, n.q_p0, n.k_cache, n.v_cache, n.win0, n.mask_p0, n.pen_p0, out_p0);
++    rpa::prefill_kvd256::ragged_prefill_pair_kvd256_r16_o8(device, n.q_p1, n.k_cache, n.v_cache, n.win1, n.mask_p1, n.pen_p1, out_p1);
++    dattn::sliding_blk::sliding_decode_attend16_blk_view_g2_o8(device, n.q_d0, n.k_blk, n.v_blk, n.index_d0, n.mask_d0, out_p1);
++    dattn::sliding_blk::sliding_decode_attend16_blk_view_o8(device, n.q_d1, n.k_blk, n.v_blk, n.index_d1, n.mask_d1, out_p1);
++    let a0: HbmTensorView<'_, f8e4m3, Chip, m![C32, Tk128, E32]> = unsafe { out_p0.view().reshape() };
++    let a1: HbmTensorView<'_, f8e4m3, Chip, m![C32, Tk128, E32]> = unsafe { out_p1.view().reshape() };
++    int8::ffn::layer_sliding_pair_v_i8_bfd(
+         device, a0, a1, w.w0, w.w1, w.w2, w.s0, w.s1, w.s2, w.post_attn_norm, res_in, w.pre_w, w.up_q, w.up_ws, w.gate_q, w.gate_ws, w.down_w, w.down_s, w.dgs,
+         w.post_ff, layer_scalar, res_out, w.had,
+     );
+@@ -241,12 +331,13 @@
+ pub fn sliding_n3_layer_b32_i8(
+     device: &mut Device,
+     n: &crate::ops_fl::N3In32<'_>,
+-    w: &LayerW8<'_>,
++    w: &LayerW8B<'_>,
+     layer_scalar: &crate::device::ffnc::ScalarRep,
+     res_in: &Res,
+     out_p0: &mut HbmTensor<f8e4m3, Chip, rpa::prefill_kvd256::O8P0>,
+     out_p1: &mut HbmTensor<f8e4m3, Chip, rpa::prefill_kvd256::O8P1>,
+     res_out: &mut Res,
+ ) {
+-    n3_layer_i8_32(device, n, w, layer_scalar, res_in, out_p0, out_p1, res_out);
++    // i8d: only the E2-type layers (next layer = full) reach this K'-slot launch -> their static bf16 down
++    n3_layer_i8_32_bfd(device, n, w, layer_scalar, res_in, out_p0, out_p1, res_out);
+ }

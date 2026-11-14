@@ -1,0 +1,23 @@
+{
+  "candidate": "decode_pair",
+  "submission_id": "b1df92a0",
+  "status": "completed [test]",
+  "score": 248.6798,
+  "kind": "test --bin",
+  "concurrency": 22,
+  "server_sha256": "987d44672c8027bbbe3df19278c7ffe5c790fd442cc42e73fef3d6b27d7f4384",
+  "checked_at": "2026-10-11T12:44:37.769692+00:00",
+  "accuracy": {
+    "passed": 32,
+    "total": 32
+  },
+  "ttft_ms": {
+    "p50": 1538.45,
+    "p90": 1898.34
+  },
+  "tpot_ms": {
+    "p50": 62.83,
+    "p90": 65.63
+  },
+  "latency_passed": true
+}

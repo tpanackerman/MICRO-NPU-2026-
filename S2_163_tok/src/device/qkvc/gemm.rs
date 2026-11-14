@@ -1,0 +1,222 @@
+//! Stage 1 of the chunk QKV: multi-token fp8 GEMM, weight stationary in the TRF (the kprobe `wst` mapping, measured on hardware).
+//!
+//! y[t, n] = (xn[t, :] . W[n, :]) * scale[n], xn bf16 (input-normalised activations), W f8e4m3, scale bf16, y bf16.
+//! Slice (per cluster, 256) = [Gg % 8, Kc]: row group g = cluster * 8 + Gg % 8, K chunk c (Kc = 32 chunks of Ke = 128; chunks 30, 31
+//! are zero in both x and W).  The weight of group g is processed in row tiles of Rt = 64 rows (`Rq` tiles per group), every tile its
+//! own HBM tensor W_i[Gg, Kc, Rt, Ke] holding natural rows n = g * (Rq * 64) + i * 64 + rt.  Per tile: DMA (HBM -> DM), decode f8 ->
+//! bf16 on Main (fetch_cast f32 + Cast, no table), TRF load on Sub, contraction of the Tc tokens, VE inter-slice reduce over the 32
+//! chunk slices, per-row scale, bf16.  The result of tile i lands on the 8 live slices per cluster (`SlOut`) in the token-major
+//! combined buffer y[Tc, Rq, Rt] (so [Tc, Rq * Rt] is the natural row order of the group, i.e. a whole head for Q).
+use furiosa_opt_std::prelude::*;
+
+use crate::Chip;
+use crate::axes::*;
+
+pub(crate) type Cl = m![Gg / 8];
+pub(crate) type Sl = m![Gg % 8, Kc];
+pub(crate) type SlOut = m![Gg % 8, 1 # 32];
+
+/// x[Tc, Kc, Ke] (HBM, chunk-major with 2 zero chunks) -> every row group gets the whole x on its 32 chunk slices (DMA replication).
+pub(crate) fn load_x(device: &mut Device, xn: &HbmTensor<bf16, Chip, m![Tc, Kc, Ke]>) -> DmTensor<bf16, Chip, Cl, Sl, m![Tc, Ke]> {
+    xn.to_dm(&mut device.tdma)
+}
+
+macro_rules! load_fns {
+    ($load:ident, $Rq:ident, $nrq:literal, $R:ident) => {
+        /// Row tile `i` of the packed weight W[Rq, Gg, Kc, R, Ke] (one contiguous run per slice).
+        pub(crate) fn $load(
+            device: &mut Device,
+            w: &HbmTensor<f8e4m3, Chip, m![$Rq, Gg, Kc, $R, Ke]>,
+            i: usize,
+        ) -> DmTensor<f8e4m3, Chip, Cl, Sl, m![$R, Ke]> {
+            w.view().tile::<m![$Rq], 1, m![$Rq = 1 # $nrq, Gg, Kc, $R, Ke]>(i).to_dm(&mut device.tdma)
+        }
+    };
+}
+load_fns!(load_w_q, Rq4, 4, Rt);
+load_fns!(load_w_kv, Rq2, 2, Rt);
+load_fns!(load_w_qf, Rq8, 8, Rt);
+
+/// Whole (single tile) weight W[Gg, Kc, R, Ke].
+pub(crate) fn load_w_k1(device: &mut Device, w: &HbmTensor<f8e4m3, Chip, m![Gg, Kc, Rk, Ke]>) -> DmTensor<f8e4m3, Chip, Cl, Sl, m![Rk, Ke]> {
+    w.to_dm(&mut device.tdma)
+}
+
+/// Decode (Main), TRF load (Sub), contraction + inter-slice reduce + row scale (Main): the body shared by all tile functions.
+macro_rules! tile_body {
+    ($device:ident, $x_dm:ident, $w_f8:ident, $scale_view:expr, $R:ident) => {{
+        let scale_vrf: VrfTensor<f32, Chip, Cl, SlOut, m![$R]> = $device
+            .sub
+            .begin($scale_view)
+            .fetch::<m![$R / 8], m![$R % 8]>()
+            .fetch_cast::<f32>()
+            .collect::<m![$R / 8], m![$R % 8]>()
+            .to_vrf();
+
+        let w_bf: DmTensor<bf16, Chip, Cl, Sl, m![$R, Ke]> = $device
+            .main
+            .begin($w_f8.view())
+            .fetch::<m![$R, Ke / 32], m![Ke % 32]>()
+            .fetch_cast::<f32>()
+            .collect::<m![$R, Ke / 32, Ke % 32 / 8], m![Ke % 8]>()
+            .cast::<bf16, m![Ke % 8 # 16]>()
+            .commit_trim::<m![Ke % 8]>()
+            .commit();
+        let w_trf: TrfTensor<bf16, Chip, Cl, Sl, m![$R % 8], m![$R / 8, Ke]> = $device
+            .sub
+            .begin(w_bf.view())
+            .fetch::<m![$R % 8, $R / 8, Ke / 16], m![Ke % 16]>()
+            .collect::<m![$R % 8, $R / 8, Ke / 16], m![Ke % 16]>()
+            .to_trf();
+
+        $device
+            .main
+            .begin($x_dm.view())
+            .fetch::<m![Tc, Ke / 16], m![Ke % 16]>()
+            .collect::<m![Tc, Ke / 16], m![Ke % 16]>()
+            .contract_outer::<m![Tc, Ke / 32, $R / 8], m![Ke % 32], _, _, _>(&w_trf)
+            .contract_packet::<m![1]>()
+            .contract_time::<m![Tc, $R / 8]>()
+            .contract_lane::<m![Tc, $R / 8], m![$R % 8]>(LaneMode::Interleaved)
+            .vector_init()
+            .vector_inter_slice_reduce::<SlOut, m![Tc, $R / 8]>(InterSliceReduceOpF32::Add)
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![Tc, $R / 8, $R / 4 % 2], m![$R % 4]>()
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &scale_vrf)
+            .vector_widen_concat::<m![Tc, $R / 8], m![$R % 8]>()
+            .vector_final()
+            .cast::<bf16, m![$R % 8 # 16]>()
+            .commit_trim::<m![$R % 8]>()
+    }};
+}
+
+/// One row tile: `i` (a literal at every call site) selects the tile column of the combined buffer.
+macro_rules! proc_tile {
+    ($name:ident, $load_s:ident, $Rq:ident, $nrq:literal, $R:ident) => {
+        /// All row scales of the projection in ONE DMA: S[Rq, Gg, R] -> per slice [Rq, R] (live slices only).
+        pub(crate) fn $load_s(device: &mut Device, s: &HbmTensor<bf16, Chip, m![$Rq, Gg, $R]>) -> DmTensor<bf16, Chip, Cl, SlOut, m![$Rq, $R]> {
+            s.to_dm(&mut device.tdma)
+        }
+
+        pub(crate) fn $name(
+            device: &mut Device,
+            x_dm: &DmTensor<bf16, Chip, Cl, Sl, m![Tc, Ke]>,
+            w_f8: DmTensor<f8e4m3, Chip, Cl, Sl, m![$R, Ke]>,
+            scale_dm: &DmTensor<bf16, Chip, Cl, SlOut, m![$Rq, $R]>,
+            y: &mut DmTensor<bf16, Chip, Cl, SlOut, m![Tc, $Rq, $R]>,
+            i: usize,
+        ) {
+            tile_body!(device, x_dm, w_f8, scale_dm.view().tile::<m![$Rq], 1, m![$Rq = 1 # $nrq, $R]>(i), $R)
+                .commit_view(y.view_mut().tile::<m![$Rq], 1, m![Tc, $Rq = 1 #{!} $nrq, $R]>(i));
+        }
+    };
+}
+proc_tile!(proc_tile_q, load_s_q, Rq4, 4, Rt);
+proc_tile!(proc_tile_kv, load_s_kv, Rq2, 2, Rt);
+proc_tile!(proc_tile_qf, load_s_qf, Rq8, 8, Rt);
+
+/// Single-tile GEMM (full-layer K: 512 rows = 16 groups x 32 rows): returns y[Tc, Rk] on the live slices.
+pub(crate) fn proc_k1(
+    device: &mut Device,
+    x_dm: &DmTensor<bf16, Chip, Cl, Sl, m![Tc, Ke]>,
+    w_f8: DmTensor<f8e4m3, Chip, Cl, Sl, m![Rk, Ke]>,
+    scale: &HbmTensor<bf16, Chip, m![Gg, Rk]>,
+) -> DmTensor<bf16, Chip, Cl, SlOut, m![Tc, Rk]> {
+    let scale_dm: DmTensor<bf16, Chip, Cl, SlOut, m![Rk]> = scale.to_dm(&mut device.tdma);
+    tile_body!(device, x_dm, w_f8, scale_dm.view(), Rk).commit()
+}
+
+/// One token block of a pair tile: contraction of `$x` against the loaded TRF weight, inter-slice reduce, row scale, bf16, committed to `$y` (a view of the combined buffer).
+macro_rules! contract_block {
+    ($device:ident, $x:ident, $w_trf:ident, $scale_vrf:ident, $R:ident, $y:expr) => {
+        $device
+            .main
+            .begin($x.view())
+            .fetch::<m![Tc, Ke / 16], m![Ke % 16]>()
+            .collect::<m![Tc, Ke / 16], m![Ke % 16]>()
+            .contract_outer::<m![Tc, Ke / 32, $R / 8], m![Ke % 32], _, _, _>(&$w_trf)
+            .contract_packet::<m![1]>()
+            .contract_time::<m![Tc, $R / 8]>()
+            .contract_lane::<m![Tc, $R / 8], m![$R % 8]>(LaneMode::Interleaved)
+            .vector_init()
+            .vector_inter_slice_reduce::<SlOut, m![Tc, $R / 8]>(InterSliceReduceOpF32::Add)
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![Tc, $R / 8, $R / 4 % 2], m![$R % 4]>()
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &$scale_vrf)
+            .vector_widen_concat::<m![Tc, $R / 8], m![$R % 8]>()
+            .vector_final()
+            .cast::<bf16, m![$R % 8 # 16]>()
+            .commit_trim::<m![$R % 8]>()
+            .commit_view($y)
+    };
+}
+
+/// PAIR variant of `tile_body`: ONE weight tile is decoded (Main) and loaded into the TRF (Sub) once, then TWO token blocks (`$x0`, `$x1`, 64 tokens each) are contracted against it and
+/// committed into `$y0` / `$y1`. The weight stream, the decode and the TRF load (the fixed cost of the GEMM) are shared by 128 rows instead of 64.
+macro_rules! tile_pair_body {
+    ($device:ident, $x0:ident, $x1:ident, $w_f8:ident, $scale_view:expr, $R:ident, $y0:expr, $y1:expr) => {{
+        let scale_vrf: VrfTensor<f32, Chip, Cl, SlOut, m![$R]> = $device
+            .sub
+            .begin($scale_view)
+            .fetch::<m![$R / 8], m![$R % 8]>()
+            .fetch_cast::<f32>()
+            .collect::<m![$R / 8], m![$R % 8]>()
+            .to_vrf();
+
+        let w_bf: DmTensor<bf16, Chip, Cl, Sl, m![$R, Ke]> = $device
+            .main
+            .begin($w_f8.view())
+            .fetch::<m![$R, Ke / 32], m![Ke % 32]>()
+            .fetch_cast::<f32>()
+            .collect::<m![$R, Ke / 32, Ke % 32 / 8], m![Ke % 8]>()
+            .cast::<bf16, m![Ke % 8 # 16]>()
+            .commit_trim::<m![Ke % 8]>()
+            .commit();
+        // TWO single-use TRF loads of the one decoded tile (a TRF tensor with two uses made the scheduler run out of TRF to evict: "Cannot find evict target for Trf"); the HBM weight DMA and
+        // the f8 decode (the dominant fixed cost) are still shared.
+        let w_trf0: TrfTensor<bf16, Chip, Cl, Sl, m![$R % 8], m![$R / 8, Ke]> = $device
+            .sub
+            .begin(w_bf.view())
+            .fetch::<m![$R % 8, $R / 8, Ke / 16], m![Ke % 16]>()
+            .collect::<m![$R % 8, $R / 8, Ke / 16], m![Ke % 16]>()
+            .to_trf();
+        contract_block!($device, $x0, w_trf0, scale_vrf, $R, $y0);
+        let w_trf1: TrfTensor<bf16, Chip, Cl, Sl, m![$R % 8], m![$R / 8, Ke]> = $device
+            .sub
+            .begin(w_bf.view())
+            .fetch::<m![$R % 8, $R / 8, Ke / 16], m![Ke % 16]>()
+            .collect::<m![$R % 8, $R / 8, Ke / 16], m![Ke % 16]>()
+            .to_trf();
+        contract_block!($device, $x1, w_trf1, scale_vrf, $R, $y1);
+    }};
+}
+
+macro_rules! proc_tile_pair {
+    ($name:ident, $Rq:ident, $nrq:literal, $R:ident) => {
+        /// One row tile for both token blocks (`y0` / `y1` = the combined buffers of the two blocks); `i` selects the tile column.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn $name(
+            device: &mut Device,
+            x0: &DmTensor<bf16, Chip, Cl, Sl, m![Tc, Ke]>,
+            x1: &DmTensor<bf16, Chip, Cl, Sl, m![Tc, Ke]>,
+            w_f8: DmTensor<f8e4m3, Chip, Cl, Sl, m![$R, Ke]>,
+            scale_dm: &DmTensor<bf16, Chip, Cl, SlOut, m![$Rq, $R]>,
+            y0: &mut DmTensor<bf16, Chip, Cl, SlOut, m![Tc, $Rq, $R]>,
+            y1: &mut DmTensor<bf16, Chip, Cl, SlOut, m![Tc, $Rq, $R]>,
+            i: usize,
+        ) {
+            tile_pair_body!(
+                device,
+                x0,
+                x1,
+                w_f8,
+                scale_dm.view().tile::<m![$Rq], 1, m![$Rq = 1 # $nrq, $R]>(i),
+                $R,
+                y0.view_mut().tile::<m![$Rq], 1, m![Tc, $Rq = 1 #{!} $nrq, $R]>(i),
+                y1.view_mut().tile::<m![$Rq], 1, m![Tc, $Rq = 1 #{!} $nrq, $R]>(i)
+            );
+        }
+    };
+}
+proc_tile_pair!(proc_tile_q_pair, Rq4, 4, Rt);
+proc_tile_pair!(proc_tile_kv_pair, Rq2, 2, Rt);

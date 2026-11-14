@@ -1,0 +1,15 @@
+# S2_203_tok: Stage 2 version `s2-hyb-t256c-b8`, official score 203.4165 generated tokens/s (submission 49c88d1b, 2026-10-07)
+
+**What this folder is.** A snapshot of the Stage 2 version that was submitted: the organisers' baseline files (README at baseline 573d6bf, SERVING, scripts, Cargo files) plus the validated Stage 2 `src/` (141 files, byte-identical to what was uploaded; `src/api` is the organisers' own). The Stage 1 folders and `S2_163_tok` in this repo are separate.
+
+**Source.** Tag `s2-hyb-t256c-b8` (commit ca66aae in `stage2/t256c`), upload-set server md5 `5f3cb49c646bb2ca098ea7c306e175ca`. Submitted with `moa-submitter submit --source <this src set> --concurrency 18` (submission **49c88d1b**, EDABK-Artemis, 3 of 4 used in the 24 h window). To submit this folder again (WSL, only on purpose): `export PATH=$HOME/.cargo/bin:$PATH; moa-submitter submit --source <this folder> --concurrency 18`.
+
+**What is in it (all exact, FP8 weight fold OFF by default).** The `s2-hyb-fin6` base plus: KVD (KV decode gather), the layer64k G change, cpuplace hardening, the QKV "qb" change, a 256-row hybrid pass (240 prefill rows + 16 decode riders, capacity 18) with KVD-256 attention, and a native bf16 T=256 FFN/attention layer (one weight tile shared by two 128-row halves, -19.8 % static cycles, about -3.7 ms per 256-row pass versus the 2 x 128-row path).
+
+**Gates passed (Arena).** Compliance `tools/compliance_check.sh`: 0 hard failures, 1 warning (the `S2_FP8` environment switch name, dead at grading). Hash identity of the native bf16 layer against the 2 x 128-row path (two fixtures). Accuracy 12/12 at default environment (six suites at concurrency 1 and 12). Mixed stream versus the previous build (7nf): pass -3.7 ms fast and -3.9 ms slow; at C=18 slow 178 tok/s median (7nf 171), fast 195 (7nf 188).
+
+**Official result (organisers' evaluation, 2026-10-07 16:47-17:12 UTC).** Accuracy 32 / 32 cases passed (2 rounds). Performance at concurrency 18: **203.42 tokens/s**, TTFT p50/p90 691 / 1154 ms, TPOT p50/p90 76.3 / 79.3 ms (gates 4.0 s and 100 ms passed). Per input type TPOT p90: 256 text 79.7 ms, 1024 text 78.5 ms, 2048 text 77.9 ms, 512 image 80.2 ms, 768 audio 79.4 ms.
+
+**Honest open points.** (1) The README still has TBD lines on the boundary of permitted kernel techniques and reproducibility; the FFN-down accumulation order inherited from `s2-hyb-fin6` (E10) is part of this stack. (2) The FP8 fold and a tail-bf16 fold policy were prepared and measured separately but are NOT in this version (the fold failed one private vqav2 case in an earlier submission; the tail policy was not shipped). (3) An optional race-free decode-gather patch was built (b9) and not merged: +0.54 ms per 256-row pass, no benefit demonstrated on this build. (4) The 200 tok/s estimate came from Arena fast-class numbers times about 1.04; the grader result confirms it.
+
+**Where the evidence is.** `RESULTS_t256c_b8.md` in this folder, `stage2/t256c/RESULTS.md` and `PROGRESS.md`, `stage2/b9/RESULTS.md`, `stage2/layouthaz/RESULTS.md`, `stage2/foldtail/RESULTS_foldtail.md`.

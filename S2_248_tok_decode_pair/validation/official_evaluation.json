@@ -1,0 +1,24 @@
+{
+  "candidate": "decode_pair",
+  "submission_id": "0759d92a",
+  "kind": "official source",
+  "concurrency": 22,
+  "validated_test_submission": "b1df92a0",
+  "validated_test_score": 248.6798,
+  "status": "completed",
+  "score": 247.9917,
+  "checked_at": "2026-10-11T13:57:08.673310+00:00",
+  "accuracy": {
+    "passed": 32,
+    "total": 32
+  },
+  "latency_passed": true,
+  "ttft_ms": {
+    "p50": 1544.84,
+    "p90": 1847.22
+  },
+  "tpot_ms": {
+    "p50": 63.19,
+    "p90": 65.93
+  }
+}

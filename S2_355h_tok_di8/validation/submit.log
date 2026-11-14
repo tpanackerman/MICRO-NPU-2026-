@@ -1,0 +1,12 @@
+Binary:       /mnt/d/AI_ML_DL/Micro/stage2/steps4_20261014/lossy/source/server (28.4 MiB, 10.3 MiB compressed)
+Concurrency:  30
+
+Test run: the build is skipped, and it counts toward your daily limit once it reaches evaluation.
+
+Submitted as: EDABK-Artemis
+Submission:   5ae97a69
+Kind:         test run (--bin), not added to the leaderboard
+Daily limit:  2 of 4 used in the last 24 hours
+
+Track it with:  moa-submitter status
+Read the log:   moa-submitter log 5ae97a69
